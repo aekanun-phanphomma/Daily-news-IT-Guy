@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import calendar
 import hashlib
+import html
 import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -42,9 +44,13 @@ from urllib3.util.retry import Retry
 
 MAX_AGE_HOURS = 48          # ignore anything older than this
 MAX_ITEMS_PER_FEED = 5      # stop one chatty feed from owning the digest
-MAX_TOTAL_ITEMS = 20        # readable message length
+# Dropped from 20 when per-item summaries were added. A summary roughly
+# doubles the space an item takes, and 20 summarized items spill into four
+# Discord messages every morning, which is spam rather than a digest.
+MAX_TOTAL_ITEMS = 12
 MAX_SEEN_HASHES = 2000      # bound the dedup file so the repo stays small
 MAX_TITLE_CHARS = 180       # one verbose headline should not own three lines
+MAX_SUMMARY_CHARS = 120     # one line under the headline, not a paragraph
 
 HTTP_TIMEOUT = 15           # seconds, per request
 DISCORD_EMBED_DESC_LIMIT = 4096
@@ -193,6 +199,36 @@ def build_session() -> requests.Session:
     return session
 
 
+def clean_html(raw: str) -> str:
+    """Flatten a feed's HTML description into one line of plain text.
+
+    RSS descriptions are full HTML: paragraphs, tracking pixels, "read more"
+    anchors, sometimes an entire article. Tags become spaces (not nothing, or
+    `<p>a</p><p>b</p>` turns into "ab"), entities are decoded, and whitespace
+    is collapsed.
+    """
+    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw or "",
+                  flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return " ".join(html.unescape(text).split())
+
+
+def entry_summary(entry) -> str:
+    """The feed's own description of an entry, trimmed to one line.
+
+    This is why the digest has summaries without needing an API key at all:
+    every one of these feeds already ships a description and we were throwing
+    it away. Gemini, when configured, replaces this with Thai -- but the
+    no-key path is no longer just a bare link.
+    """
+    raw = ""
+    if getattr(entry, "content", None):
+        raw = entry.content[0].get("value", "")
+    if not raw:
+        raw = entry.get("summary") or entry.get("description") or ""
+    return shorten(clean_html(raw), MAX_SUMMARY_CHARS)
+
+
 def parse_iso8601(value: str | None) -> datetime:
     """Parse a GitHub API timestamp, falling back to now on anything odd.
 
@@ -253,6 +289,7 @@ def fetch_rss(session: requests.Session, feed: dict[str, str]) -> list[NewsItem]
             source=feed["name"],
             category=feed["category"],
             published=entry_published(entry),
+            summary=entry_summary(entry),
         ))
     return items
 
@@ -337,12 +374,12 @@ def fetch_github_trending(session: requests.Session,
 
     items: list[NewsItem] = []
     for repo in response.json().get("items", [])[:want]:
-        description = (repo.get("description") or "").strip()
-        title = f"{repo['full_name']} ⭐ {repo.get('stargazers_count', 0)}"
-        if description:
-            title = f"{title} — {description}"
         items.append(NewsItem(
-            title=title,
+            # The repo description belongs in the summary line, not glued onto
+            # the title -- that way it lines up with every other source.
+            title=f"{repo['full_name']} ⭐ {repo.get('stargazers_count', 0)}",
+            summary=shorten(clean_html(repo.get("description") or ""),
+                            MAX_SUMMARY_CHARS),
             link=repo["html_url"],
             source="GitHub Trending",
             category="trending",
@@ -495,7 +532,13 @@ def add_summaries(items: list[NewsItem]) -> None:
         log.warning("Gemini summaries: skipped (google-genai not installed)")
         return
 
-    numbered = "\n".join(f"{n}. {item.title}" for n, item in enumerate(items, 1))
+    # The feed's own description goes in too. A headline alone is often too
+    # thin to summarize honestly ("Now generally available" -- what is?), and
+    # the description is already in hand for free.
+    numbered = "\n".join(
+        f"{n}. {item.title}" + (f" | {item.summary}" if item.summary else "")
+        for n, item in enumerate(items, 1)
+    )
     prompt = (
         "สรุปพาดหัวข่าว"
         "ไอทีเหล่านี้เป็น"
