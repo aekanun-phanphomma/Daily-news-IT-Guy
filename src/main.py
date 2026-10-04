@@ -1404,11 +1404,14 @@ def main() -> int:
                       f"({len(text)}/{DISCORD_CONTENT_LIMIT} chars, "
                       f"{len(chunk_items)} item(s)) -----")
                 print(text)
-            if os.environ.get("LINKEDIN_ACCESS_TOKEN", "").strip():
-                preview = render_linkedin(picked)
-                print(f"\n----- DRY RUN: LinkedIn "
-                      f"({len(preview)}/{LINKEDIN_TEXT_LIMIT} chars) -----")
-                print(preview)
+            # Printed whether or not a token is configured: the point of a dry
+            # run is to see the formatting before committing to it, and
+            # LinkedIn's escaping rules are exactly the kind of thing you want
+            # to eyeball rather than discover as a 422 in production.
+            preview = render_linkedin(picked)
+            print(f"\n----- DRY RUN: LinkedIn "
+                  f"({len(preview)}/{LINKEDIN_TEXT_LIMIT} chars) -----")
+            print(preview)
             log.info("DRY_RUN=1 — not posting and not updating seen_urls.json")
             return 0
 
