@@ -644,12 +644,25 @@ def send_discord(session: requests.Session, webhook_url: str, embed: dict) -> No
     workflow step, which means the "commit seen_urls.json" step never runs and
     today's items stay unseen. The next run re-sends them instead of silently
     dropping a day of news.
+
+    Two details here exist because of a real failure, not theory. Discord will
+    happily accept a webhook POST and then *strip the embed* if the channel
+    does not grant Embed Links to @everyone -- the webhook has no role of its
+    own, so it inherits those permissions. The result is a message that exists,
+    is timestamped, and is completely blank. The API reports that as success.
+
+    So: `content` carries a plain-text headline that survives even when embeds
+    are stripped, and `?wait=true` makes Discord return the message it actually
+    stored instead of a bare 204, which lets us check what survived and say so
+    in the log.
     """
-    response = session.post(
-        webhook_url,
-        json={"embeds": [embed]},
-        timeout=HTTP_TIMEOUT,
-    )
+    payload = {
+        "content": f"{embed['title']}  ({embed['footer']['text']})",
+        "embeds": [embed],
+    }
+    url = webhook_url + ("&" if "?" in webhook_url else "?") + "wait=true"
+
+    response = session.post(url, json=payload, timeout=HTTP_TIMEOUT)
 
     # Webhooks are rate limited per channel. At one message a day we will never
     # see this, but a burst of manual test runs can.
@@ -657,15 +670,35 @@ def send_discord(session: requests.Session, webhook_url: str, embed: dict) -> No
         wait = float(response.json().get("retry_after", 2))
         log.warning("Discord rate limited, retrying in %.1fs", wait)
         time.sleep(wait + 0.5)
-        response = session.post(
-            webhook_url, json={"embeds": [embed]}, timeout=HTTP_TIMEOUT
-        )
+        response = session.post(url, json=payload, timeout=HTTP_TIMEOUT)
 
     if response.status_code not in (200, 204):
         raise RuntimeError(
             f"Discord webhook returned {response.status_code}: {response.text[:300]}"
         )
-    log.info("Discord: message delivered (HTTP %s)", response.status_code)
+
+    log.info("Discord: accepted (HTTP %s)", response.status_code)
+
+    # With wait=true we get the stored message back, so we can confirm the
+    # embed is really there rather than trusting the status code.
+    try:
+        stored = response.json()
+    except ValueError:
+        return
+
+    embeds = stored.get("embeds") or []
+    log.info("Discord: message id %s in channel %s, %d embed(s) stored",
+             stored.get("id"), stored.get("channel_id"), len(embeds))
+
+    if not embeds:
+        log.warning(
+            "Discord accepted the message but stored NO embed. The channel is "
+            "almost certainly missing the 'Embed Links' permission for "
+            "@everyone -- a webhook inherits that role. Channel Settings -> "
+            "Permissions -> @everyone -> Embed Links."
+        )
+    elif not embeds[0].get("description"):
+        log.warning("Discord stored the embed without its description")
 
 
 # --------------------------------------------------------------------------
