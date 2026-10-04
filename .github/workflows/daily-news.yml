@@ -66,6 +66,10 @@ jobs:
           # Lifts the GitHub Search API rate limit for the trending lookup.
           GITHUB_TOKEN: ${{ github.token }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          # "text" renders in any channel. Switch to "embed" for the nicer
+          # format once the channel grants Embed Links to @everyone -- see the
+          # output format section of the README.
+          DISCORD_FORMAT: text
         run: python src/main.py
 
       - name: Commit dedup state

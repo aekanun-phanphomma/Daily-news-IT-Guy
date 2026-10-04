@@ -48,6 +48,14 @@ MAX_TITLE_CHARS = 180       # one verbose headline should not own three lines
 
 HTTP_TIMEOUT = 15           # seconds, per request
 DISCORD_EMBED_DESC_LIMIT = 4096
+DISCORD_CONTENT_LIMIT = 2000   # plain message body; less than half an embed
+
+# "embed" is the prettier format but it only displays when the channel grants
+# Embed Links to @everyone -- a webhook has no role of its own and inherits
+# that one. Where it is missing, Discord accepts the message, keeps the embed
+# on the message object, and renders nothing. "text" has no such dependency,
+# at the cost of splitting a long digest across two or three messages.
+DISCORD_FORMAT = os.environ.get("DISCORD_FORMAT", "text").strip().lower()
 
 # Bangkok is UTC+7 year round and has never observed DST, so a fixed offset is
 # correct here. Using it avoids depending on the `tzdata` package, which is not
@@ -637,6 +645,110 @@ def build_embed(items: list[NewsItem]) -> tuple[dict, list[NewsItem]]:
     return embed, delivered
 
 
+def build_text_messages(items: list[NewsItem]) -> list[tuple[str, list[NewsItem]]]:
+    """Render the digest as plain messages, each under the 2,000-char limit.
+
+    Returns (text, items_in_that_message) pairs. Carrying the items alongside
+    each chunk is what lets the caller record only what was actually
+    delivered, the same invariant build_embed() keeps: if the third message
+    fails to send, its items must stay unseen.
+    """
+    today = datetime.now(BANGKOK).strftime("%Y-%m-%d")
+    header = f"\U0001F4CB **Daily DevOps & Infra News — {today}**"
+    footer = (f"\U0001F916 Auto-generated · {len(items)} items "
+              f"· powered by GitHub Actions")
+
+    chunks: list[tuple[str, list[NewsItem]]] = []
+    lines: list[str] = [header]
+    chunk_items: list[NewsItem] = []
+    used = len(header)
+
+    for item, line in render_lines(items):
+        cost = len(line) + 1          # the joining newline
+        if used + cost > DISCORD_CONTENT_LIMIT:
+            chunks.append(("\n".join(lines), chunk_items))
+            lines, chunk_items, used = [], [], 0
+            cost = len(line)
+            if not line.strip():      # do not open a message with a blank line
+                continue
+        lines.append(line)
+        used += cost
+        if item is not None:
+            chunk_items.append(item)
+
+    if lines:
+        chunks.append(("\n".join(lines), chunk_items))
+
+    # The footer goes on the last message if there is room, otherwise it is
+    # dropped -- it is a decoration, not worth a whole extra message.
+    if chunks:
+        text, chunk_items = chunks[-1]
+        if len(text) + len(footer) + 2 <= DISCORD_CONTENT_LIMIT:
+            chunks[-1] = (f"{text}\n\n{footer}", chunk_items)
+
+    return chunks
+
+
+class PartialDelivery(RuntimeError):
+    """Raised when some messages landed and a later one did not.
+
+    Carries the items that did make it, so the caller can record exactly those
+    and let the rest come round again tomorrow.
+    """
+
+    def __init__(self, delivered: list[NewsItem], cause: Exception):
+        super().__init__(f"delivery failed after {len(delivered)} item(s): {cause}")
+        self.delivered = delivered
+
+
+def post_webhook(session: requests.Session, webhook_url: str, payload: dict) -> dict:
+    """POST one message and return what Discord says it stored.
+
+    `?wait=true` is the point: without it Discord answers 204 with no body,
+    which tells you the bytes were accepted but nothing about what a human
+    will see.
+    """
+    url = webhook_url + ("&" if "?" in webhook_url else "?") + "wait=true"
+    response = session.post(url, json=payload, timeout=HTTP_TIMEOUT)
+
+    # Webhooks are rate limited per channel. At one message a day we will never
+    # see this, but a multi-part digest or a burst of test runs can.
+    if response.status_code == 429:
+        wait = float(response.json().get("retry_after", 2))
+        log.warning("Discord rate limited, retrying in %.1fs", wait)
+        time.sleep(wait + 0.5)
+        response = session.post(url, json=payload, timeout=HTTP_TIMEOUT)
+
+    if response.status_code not in (200, 204):
+        raise RuntimeError(
+            f"Discord webhook returned {response.status_code}: {response.text[:300]}"
+        )
+    try:
+        return response.json()
+    except ValueError:
+        return {}
+
+
+def send_discord_text(session: requests.Session, webhook_url: str,
+                      chunks: list[tuple[str, list[NewsItem]]]) -> list[NewsItem]:
+    """Send the digest as plain messages. Returns the items that landed."""
+    delivered: list[NewsItem] = []
+    for number, (text, chunk_items) in enumerate(chunks, 1):
+        try:
+            stored = post_webhook(session, webhook_url, {"content": text})
+        except Exception as exc:
+            if delivered:
+                raise PartialDelivery(delivered, exc) from exc
+            raise
+        delivered.extend(chunk_items)
+        log.info("Discord: part %d/%d sent (%d chars, %d item(s), id %s)",
+                 number, len(chunks), len(text), len(chunk_items),
+                 stored.get("id"))
+        if number < len(chunks):
+            time.sleep(1)   # stay well clear of the per-channel rate limit
+    return delivered
+
+
 def send_discord(session: requests.Session, webhook_url: str, embed: dict) -> None:
     """POST the embed to the Discord webhook.
 
@@ -747,19 +859,42 @@ def main() -> int:
     log.info("sending %d item(s) (cap %d)", len(picked), MAX_TOTAL_ITEMS)
 
     add_summaries(picked)
-    embed, delivered = build_embed(picked)
+    log.info("output format: %s", DISCORD_FORMAT)
 
-    if dry_run:
-        print("\n----- DRY RUN: embed preview -----")
-        print(embed["title"])
-        print(embed["description"])
-        print(embed["footer"]["text"])
-        print(f"----- description: {len(embed['description'])}/"
-              f"{DISCORD_EMBED_DESC_LIMIT} chars -----\n")
-        log.info("DRY_RUN=1 — not posting and not updating seen_urls.json")
-        return 0
+    if DISCORD_FORMAT == "text":
+        chunks = build_text_messages(picked)
 
-    send_discord(session, webhook_url, embed)
+        if dry_run:
+            for number, (text, chunk_items) in enumerate(chunks, 1):
+                print(f"\n----- DRY RUN: part {number}/{len(chunks)} "
+                      f"({len(text)}/{DISCORD_CONTENT_LIMIT} chars, "
+                      f"{len(chunk_items)} item(s)) -----")
+                print(text)
+            log.info("DRY_RUN=1 — not posting and not updating seen_urls.json")
+            return 0
+
+        try:
+            delivered = send_discord_text(session, webhook_url, chunks)
+        except PartialDelivery as exc:
+            # Some messages landed. Record those so they are not sent twice,
+            # then still fail the job so the red X shows up in the Actions tab.
+            save_seen(SEEN_PATH, seen + [i.hash for i in exc.delivered])
+            log.error("%s", exc)
+            return 1
+    else:
+        embed, delivered = build_embed(picked)
+
+        if dry_run:
+            print("\n----- DRY RUN: embed preview -----")
+            print(embed["title"])
+            print(embed["description"])
+            print(embed["footer"]["text"])
+            print(f"----- description: {len(embed['description'])}/"
+                  f"{DISCORD_EMBED_DESC_LIMIT} chars -----\n")
+            log.info("DRY_RUN=1 — not posting and not updating seen_urls.json")
+            return 0
+
+        send_discord(session, webhook_url, embed)
 
     # Only now, after a confirmed delivery, does state move forward -- and only
     # for the items that really made it into the message.
