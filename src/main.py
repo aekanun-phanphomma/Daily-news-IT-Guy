@@ -44,10 +44,13 @@ from urllib3.util.retry import Retry
 
 MAX_AGE_HOURS = 48          # ignore anything older than this
 MAX_ITEMS_PER_FEED = 5      # stop one chatty feed from owning the digest
-# Three per category across the eight categories. Raising this costs messages,
-# not minutes: a summarized item is ~380 characters and a Discord message holds
-# 2,000, so every three extra items is roughly one more message in the morning.
-MAX_TOTAL_ITEMS = 24
+# What actually ships. Deliberately small: the point is no longer coverage but
+# triage -- a short list someone reads at 7am beats a long one they skim.
+MAX_TOTAL_ITEMS = 14
+# How many candidates the ranker gets to choose from. Round-robin across
+# categories fills this first, so the ranker sees a balanced pool rather than
+# thirty AWS announcements and nothing else.
+RANK_POOL = 60
 MAX_SEEN_HASHES = 2000      # bound the dedup file so the repo stays small
 MAX_TITLE_CHARS = 180       # one verbose headline should not own three lines
 # Room for "what changed" plus "what to do about it". The feed's own blurb gets
@@ -113,6 +116,19 @@ CATEGORIES: dict[str, dict[str, str]] = {
     "trending": {"emoji": "\U0001F525",   "label": "Trending"},
 }
 
+# How the digest is grouped once the ranker has run. Ordering by what the team
+# has to do about an item answers the actual morning question -- "is any of
+# this my problem today?" -- which grouping by vendor never did.
+PRIORITIES: dict[str, dict[str, str]] = {
+    "ACTION": {"emoji": "\U0001F534",
+               "label": "ต้องลงมือ / "
+                        "เตรียมตัว"},
+    "WATCH":  {"emoji": "\U0001F7E1",
+               "label": "ควรจับตา"},
+    "FYI":    {"emoji": "⚪",
+               "label": "น่ารู้"},
+}
+
 FEEDS: list[dict[str, str]] = [
     # Cloud & Infrastructure
     {"name": "AWS What's New", "category": "cloud",
@@ -121,6 +137,13 @@ FEEDS: list[dict[str, str]] = [
      # azure.microsoft.com/en-us/updates/feed/ now serves an HTML error page
      # with HTTP 200. This is the backend the Azure Updates site itself reads.
      "url": "https://www.microsoft.com/releasecommunications/api/v2/azure/rss"},
+    {"name": "Azure Tech Community", "category": "cloud",
+     # Covers the Azure services that have no feed of their own: PostgreSQL,
+     # SQL, Cosmos DB, AI Foundry, Storage. The per-board RSS URLs all 404
+     # since the platform migration; this category feed is what still serves.
+     "url": "https://techcommunity.microsoft.com/t5/s/gxcuf89792/rss/Category?category.id=Azure"},
+    {"name": "AWS Service Health", "category": "cloud",
+     "url": "https://status.aws.amazon.com/rss/all.rss"},
     {"name": "Google Cloud Blog", "category": "cloud",
      # cloud.google.com/blog/feed answers 200 with HTML, not RSS; this is the
      # real feed behind the same blog.
@@ -138,6 +161,24 @@ FEEDS: list[dict[str, str]] = [
      "url": "https://istio.io/latest/blog/feed.xml"},
     {"name": "The New Stack", "category": "platform",
      "url": "https://thenewstack.io/feed/"},
+    # GitHub release feeds. These are where deprecations, breaking changes and
+    # version support windows actually get announced -- a vendor blog post is
+    # marketing, a release note is the contract. The titles are thin ("Release
+    # 2026-09-04") but the body carries the detail, and the body is what gets
+    # summarized.
+    {"name": "AKS Release Notes", "category": "platform",
+     "url": "https://github.com/Azure/AKS/releases.atom"},
+    {"name": "Kubernetes Releases", "category": "platform",
+     "url": "https://github.com/kubernetes/kubernetes/releases.atom"},
+    {"name": "Istio Releases", "category": "platform",
+     "url": "https://github.com/istio/istio/releases.atom"},
+    {"name": "Headlamp Releases", "category": "platform",
+     "url": "https://github.com/kubernetes-sigs/headlamp/releases.atom"},
+    {"name": "OPA Releases", "category": "platform",
+     "url": "https://github.com/open-policy-agent/opa/releases.atom"},
+    {"name": "Kong Blog", "category": "platform",
+     # konghq.com/blog/feed and /blog/rss.xml both 404; the site feed serves.
+     "url": "https://konghq.com/feed"},
     # DevOps & IaC
     {"name": "HashiCorp Blog", "category": "devops",
      "url": "https://www.hashicorp.com/blog/feed.xml"},
@@ -162,6 +203,12 @@ FEEDS: list[dict[str, str]] = [
      "url": "https://www.elastic.co/blog/feed"},
     {"name": "PostgreSQL News", "category": "data",
      "url": "https://www.postgresql.org/news.rss"},
+    {"name": "Kafka Releases", "category": "data",
+     "url": "https://github.com/apache/kafka/releases.atom"},
+    {"name": "Redis Releases", "category": "data",
+     "url": "https://github.com/redis/redis/releases.atom"},
+    {"name": "Elasticsearch Releases", "category": "data",
+     "url": "https://github.com/elastic/elasticsearch/releases.atom"},
     # Observability
     {"name": "Grafana Blog", "category": "observe",
      "url": "https://grafana.com/blog/index.xml"},
@@ -171,6 +218,16 @@ FEEDS: list[dict[str, str]] = [
      "url": "https://opentelemetry.io/blog/index.xml"},
     {"name": "Datadog Blog", "category": "observe",
      "url": "https://www.datadoghq.com/blog/index.xml"},
+    {"name": "New Relic Blog", "category": "observe",
+     "url": "https://newrelic.com/blog/feed"},
+    {"name": "Fluent Bit Releases", "category": "observe",
+     "url": "https://github.com/fluent/fluent-bit/releases.atom"},
+    {"name": "Fluentd Releases", "category": "observe",
+     "url": "https://github.com/fluent/fluentd/releases.atom"},
+    {"name": "Grafana Releases", "category": "observe",
+     "url": "https://github.com/grafana/grafana/releases.atom"},
+    {"name": "Prometheus Releases", "category": "observe",
+     "url": "https://github.com/prometheus/prometheus/releases.atom"},
     # AI & Models
     {"name": "OpenAI News", "category": "ai",
      "url": "https://openai.com/news/rss.xml"},
@@ -208,6 +265,10 @@ class NewsItem:
     category: str
     published: datetime
     summary: str | None = None
+    # Filled by rank_items() when Gemini is available. score drives what makes
+    # the cut; priority drives how the digest is grouped.
+    score: float = 0.0
+    priority: str = ""
 
     @property
     def hash(self) -> str:
@@ -569,8 +630,181 @@ def pick_for_digest(items: list[NewsItem],
 
 
 # --------------------------------------------------------------------------
-# Optional Phase 2: Gemini summaries
+# Gemini: triage and summaries
 # --------------------------------------------------------------------------
+
+def gemini_generate(prompt: str, label: str) -> str:
+    """One batched Gemini call, or "" if the API will not cooperate.
+
+    Shared by the ranker and the summarizer so both inherit the same model
+    fallback and retry behaviour, which was learned the hard way:
+
+      503 "high demand"   transient, and worst on the newest model.
+                          Retry the same model with backoff.
+      404 "not available" permanent for this key. Retrying is pointless;
+                          move to the next model in the list.
+
+    Neither is predictable from the outside -- a model can be listed by the
+    API and still 404 with "no longer available to new users", and which model
+    is saturated changes by the hour. Hence a list tried in order rather than
+    one id someone has to keep correcting.
+
+    Returning "" rather than raising is deliberate. Both callers have a
+    working fallback, and no part of this is worth losing a digest over.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        log.info("Gemini %s: skipped (no GEMINI_API_KEY)", label)
+        return ""
+
+    try:
+        from google import genai
+    except ImportError:
+        log.warning("Gemini %s: skipped (google-genai not installed)", label)
+        return ""
+
+    client = genai.Client(api_key=api_key)
+
+    for model in GEMINI_MODELS:
+        for attempt in range(1, GEMINI_ATTEMPTS + 1):
+            try:
+                response = client.models.generate_content(
+                    model=model, contents=prompt,
+                )
+                text = (response.text or "").strip()
+                if text:
+                    log.info("Gemini %s: using %s", label, model)
+                    return text
+                break
+            except Exception as exc:
+                transient = any(code in str(exc)
+                                for code in ("429", "500", "502", "503", "504"))
+                if not transient:
+                    log.warning("Gemini %s: %s unusable, trying next (%s)",
+                                label, model, str(exc)[:120])
+                    break
+                if attempt == GEMINI_ATTEMPTS:
+                    log.warning("Gemini %s: %s still failing after %d attempts",
+                                label, model, GEMINI_ATTEMPTS)
+                    break
+                delay = 2 ** attempt          # 2s, 4s
+                log.warning("Gemini %s: %s attempt %d/%d failed, retry in %ds",
+                            label, model, attempt, GEMINI_ATTEMPTS, delay)
+                time.sleep(delay)
+
+    log.warning("Gemini %s: no model in %s would answer",
+                label, ", ".join(GEMINI_MODELS))
+    return ""
+
+
+def parse_numbered(text: str, count: int) -> dict[int, str]:
+    """Parse "<n>. <payload>" lines into {index: payload}, 0-based.
+
+    Models wrap numbered output in stray prose, blank lines and the odd
+    markdown bullet no matter how firmly the prompt says not to. Anything that
+    does not start with a number is dropped rather than guessed at.
+    """
+    out: dict[int, str] = {}
+    for line in text.splitlines():
+        line = line.strip().lstrip("-*• ").strip()
+        if "." not in line:
+            continue
+        index_text, _, payload = line.partition(".")
+        if not index_text.strip().isdigit():
+            continue
+        index = int(index_text.strip()) - 1
+        payload = payload.strip()
+        if 0 <= index < count and payload:
+            out[index] = payload
+    return out
+
+
+def rank_items(items: list[NewsItem],
+               limit: int = MAX_TOTAL_ITEMS) -> list[NewsItem]:
+    """Let Gemini triage the candidate pool, keeping the `limit` that matter.
+
+    This is the step that turns a feed reader into something worth opening.
+    Recency and category balance -- which is all pick_for_digest() knows --
+    cannot tell a Kubernetes version deprecation that breaks your cluster in
+    90 days apart from a conference announcement published the same hour.
+
+    Each item gets a 0-10 score and one of three labels: ACTION (something to
+    do), WATCH (something to plan for), FYI (worth knowing). The labels then
+    become the digest's section headings, so the message is ordered by what
+    the team has to do rather than by which vendor published it.
+
+    Falls back to the round-robin pick when Gemini is unavailable, so the
+    digest degrades to the old behaviour instead of failing.
+    """
+    if len(items) <= limit:
+        return items
+
+    listing = "\n".join(
+        f"{n}. [{item.source}] {shorten(item.title, 120)}"
+        + (f" | {shorten(item.summary or '', 120)}" if item.summary else "")
+        for n, item in enumerate(items, 1)
+    )
+    prompt = (
+        "คุณเป็น Senior Platform/SRE Engineer ของทีมที่ดูแลระบบ production บน "
+        "Azure (AKS, Azure PostgreSQL, MSSQL, Cosmos DB, Storage, VM, "
+        "Azure DevOps, AI Foundry) และ AWS "
+        "ใช้ Kubernetes, Istio, Terraform, Kafka, Redis, Elastic "
+        "และ monitoring stack: Prometheus, Grafana, New Relic, "
+        "Fluentd/Fluent Bit, OpenTelemetry\n\n"
+        "ให้คะแนนความสำคัญข่าวแต่ละข้อ 0-10 สำหรับทีมนี้ "
+        "แล้วจัดระดับการรับมือเป็น ACTION / WATCH / FYI\n\n"
+        "เกณฑ์ให้คะแนนสูง (8-10):\n"
+        "- ช่องโหว่ CVE ร้ายแรง หรือต้องแพตช์ด่วน\n"
+        "- ประกาศ deprecate / end-of-life / retirement ที่มีวันตัดจริง\n"
+        "- breaking change หรือบังคับอัปเกรดเวอร์ชัน\n"
+        "- เหตุ outage หรือ service degradation ที่กระทบ production\n"
+        "- ฟีเจอร์ GA ที่เปลี่ยนวิธีทำงานของทีมได้จริง\n\n"
+        "เกณฑ์ให้คะแนนต่ำ (0-3):\n"
+        "- ข่าวการตลาด, case study, ประกาศงานสัมมนา, รางวัล\n"
+        "- ข่าวที่ไม่เกี่ยวกับ stack ข้างบนเลย\n\n"
+        "ระดับการรับมือ:\n"
+        "ACTION = ต้องลงมือภายในสัปดาห์นี้ (แพตช์, อัปเกรด, วางแผนย้าย)\n"
+        "WATCH  = ยังไม่ต้องทำตอนนี้ แต่ต้องเตรียมตัวไว้\n"
+        "FYI    = รู้ไว้เฉยๆ รวมถึง trend เทคโนโลยีที่ทั่วโลกกำลังใช้\n\n"
+        "ตอบเป็นรายการตัวเลขเท่านั้น บรรทัดละ 1 ข่าว "
+        "รูปแบบ \"<เลข>. <คะแนน> <ระดับ>\" เช่น \"3. 9 ACTION\" "
+        "ห้ามใส่ข้อความอธิบายอื่น\n\n"
+        f"{listing}"
+    )
+
+    text = gemini_generate(prompt, "triage")
+    if not text:
+        log.info("triage: falling back to round-robin pick")
+        return pick_for_digest(items, limit)
+
+    scored = 0
+    for index, payload in parse_numbered(text, len(items)).items():
+        parts = payload.split()
+        try:
+            items[index].score = float(parts[0])
+        except (ValueError, IndexError):
+            continue
+        level = next((p.upper() for p in parts[1:] if p.upper() in PRIORITIES),
+                     "FYI")
+        items[index].priority = level
+        scored += 1
+
+    if not scored:
+        log.warning("triage: no parseable scores, falling back to round-robin")
+        return pick_for_digest(items, limit)
+
+    # Highest score first; ties broken by recency so the pick is deterministic.
+    ranked = sorted(items, key=lambda i: (i.score, i.published), reverse=True)
+    kept = ranked[:limit]
+    log.info("triage: scored %d/%d, keeping %d (score %.1f..%.1f)",
+             scored, len(items), len(kept),
+             kept[-1].score if kept else 0, kept[0].score if kept else 0)
+    for level in PRIORITIES:
+        count = sum(1 for i in kept if i.priority == level)
+        if count:
+            log.info("triage: %-6s %d item(s)", level, count)
+    return kept
+
 
 def add_summaries(items: list[NewsItem]) -> None:
     """Attach a one-line Thai summary to each item, in place.
@@ -586,15 +820,7 @@ def add_summaries(items: list[NewsItem]) -> None:
     second. The price is parsing: the model is asked for numbered lines and
     anything that does not come back cleanly numbered is simply left blank.
     """
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key or not items:
-        log.info("Gemini summaries: skipped (no GEMINI_API_KEY)")
-        return
-
-    try:
-        from google import genai
-    except ImportError:
-        log.warning("Gemini summaries: skipped (google-genai not installed)")
+    if not items:
         return
 
     # The feed's own description goes in too. A headline alone is often too
@@ -626,69 +852,19 @@ def add_summaries(items: list[NewsItem]) -> None:
         f"{numbered}"
     )
 
-    # Two different failures, two different responses, learned the hard way:
-    #
-    #   503 "high demand"  -- transient, and the newest model gets it most.
-    #                         Retry the same model with backoff.
-    #   404 "not available" -- permanent for this key. Retrying is pointless;
-    #                         move to the next model in the list.
-    #
-    # Neither is predictable from the outside. A model can be listed by the
-    # API and still 404 ("no longer available to new users"), and which model
-    # is saturated changes by the hour. So the config is a list, tried in
-    # order, rather than a single id someone has to keep correcting.
-    text = ""
-    client = genai.Client(api_key=api_key)
-
-    for model in GEMINI_MODELS:
-        for attempt in range(1, GEMINI_ATTEMPTS + 1):
-            try:
-                response = client.models.generate_content(
-                    model=model, contents=prompt,
-                )
-                text = (response.text or "").strip()
-                break
-            except Exception as exc:
-                transient = any(code in str(exc)
-                                for code in ("429", "500", "502", "503", "504"))
-                if not transient:
-                    log.warning("Gemini: %s unusable, trying next (%s)",
-                                model, str(exc)[:120])
-                    break
-                if attempt == GEMINI_ATTEMPTS:
-                    log.warning("Gemini: %s still failing after %d attempts",
-                                model, GEMINI_ATTEMPTS)
-                    break
-                delay = 2 ** attempt          # 2s, 4s
-                log.warning("Gemini: %s attempt %d/%d failed, retrying in %ds",
-                            model, attempt, GEMINI_ATTEMPTS, delay)
-                time.sleep(delay)
-        if text:
-            log.info("Gemini: using %s", model)
-            break
-
+    text = gemini_generate(prompt, "summaries")
     if not text:
-        log.warning("Gemini summaries: skipped (no model in %s would answer)",
-                    ", ".join(GEMINI_MODELS))
+        # The feed's own descriptions are still in place, so the digest ships
+        # with English blurbs rather than nothing.
         return
 
-    # Map "3. <summary>" back onto items[2]. Lines we cannot parse are dropped.
     filled = 0
-    for line in text.splitlines():
-        line = line.strip()
-        if "." not in line:
-            continue
-        index_text, _, summary = line.partition(".")
-        if not index_text.strip().isdigit():
-            continue
-        index = int(index_text.strip()) - 1
-        summary = summary.strip()
-        if 0 <= index < len(items) and summary:
-            # The prompt asks for 200 characters, but a model asked for a
-            # length is not a model held to one. Trim rather than let one long
-            # answer push several items out of the digest entirely.
-            items[index].summary = shorten(summary, MAX_SUMMARY_CHARS)
-            filled += 1
+    for index, summary in parse_numbered(text, len(items)).items():
+        # The prompt asks for 200 characters, but a model asked for a length
+        # is not a model held to one. Trim rather than let one long answer
+        # push several items out of the digest entirely.
+        items[index].summary = shorten(summary, MAX_SUMMARY_CHARS)
+        filled += 1
 
     log.info("Gemini summaries: %d/%d item(s) summarized", filled, len(items))
 
@@ -725,20 +901,35 @@ def render_lines(items: list[NewsItem]) -> list[tuple[NewsItem | None, str]]:
     Category header rows carry `None` as their item: they are text we need in
     the embed but they are not news, so they must not be recorded as "seen".
     """
+    # Group by priority once the ranker has labelled things, by category
+    # otherwise. Priority is the more useful axis when the digest is short:
+    # "is any of this my problem today" beats "which vendor said it".
+    ranked = any(i.priority for i in items)
+    groups = PRIORITIES if ranked else CATEGORIES
+
     rows: list[tuple[NewsItem | None, str]] = []
-    for key, meta in CATEGORIES.items():
-        group = [i for i in items if i.category == key]
+    for key, meta in groups.items():
+        if ranked:
+            group = [i for i in items if (i.priority or "FYI") == key]
+            group.sort(key=lambda i: (i.score, i.published), reverse=True)
+        else:
+            group = [i for i in items if i.category == key]
+            group.sort(key=lambda i: i.published, reverse=True)
         if not group:
             continue
-        group.sort(key=lambda i: i.published, reverse=True)
 
         if rows:
-            rows.append((None, ""))     # blank line between categories
+            rows.append((None, ""))     # blank line between sections
         rows.append((None, f"**{meta['emoji']} {meta['label']}**"))
 
         for item in group:
+            # When grouping by priority the heading already carries the
+            # urgency, so each line shows its category emoji instead -- that
+            # way you still see at a glance whether it is cloud, data or
+            # security without a second heading level.
+            mark = CATEGORIES.get(item.category, {}).get("emoji", meta["emoji"])
             line = (
-                f"{meta['emoji']} [{escape_markdown(shorten(item.title))}]({item.link}) "
+                f"{mark} [{escape_markdown(shorten(item.title))}]({item.link}) "
                 f"— *{escape_markdown(item.source)}*"
             )
             if item.summary:
@@ -1007,8 +1198,14 @@ def main() -> int:
         log.info("nothing new to send — exiting without posting")
         return 0
 
-    picked = pick_for_digest(fresh)
-    log.info("sending %d item(s) (cap %d)", len(picked), MAX_TOTAL_ITEMS)
+    # Two stages on purpose. Round-robin first builds a balanced candidate
+    # pool, so the ranker is choosing between every part of the stack rather
+    # than between thirty AWS announcements. Then the ranker picks what
+    # actually matters out of that pool.
+    candidates = pick_for_digest(fresh, RANK_POOL)
+    picked = rank_items(candidates)
+    log.info("sending %d item(s) (cap %d, from %d candidate(s))",
+             len(picked), MAX_TOTAL_ITEMS, len(candidates))
 
     add_summaries(picked)
     log.info("output format: %s", DISCORD_FORMAT)
