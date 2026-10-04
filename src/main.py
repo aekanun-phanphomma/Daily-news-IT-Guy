@@ -1274,12 +1274,25 @@ def linkedin_author(session: requests.Session, token: str) -> str:
         headers={"Authorization": f"Bearer {token}"},
         timeout=HTTP_TIMEOUT,
     )
+    # 401 and 403 mean different things here and send you to different fixes,
+    # so they get different messages. Collapsing them into "auth failed" costs
+    # an hour of looking in the wrong place.
     if response.status_code == 401:
         raise RuntimeError(
             "LinkedIn rejected the token (401). These expire 60 days after "
             "they are issued and standard apps get no refresh token, so this "
             "is almost certainly expiry -- re-run the OAuth flow and update "
             "the LINKEDIN_ACCESS_TOKEN secret. See the README."
+        )
+    if response.status_code == 403:
+        raise RuntimeError(
+            "LinkedIn refused /v2/userinfo (403). The token is valid but was "
+            "not granted the 'openid profile' scopes -- that endpoint belongs "
+            "to the 'Sign In with LinkedIn using OpenID Connect' product, "
+            "which is separate from 'Share on LinkedIn'. Add that product in "
+            "the Developer Portal (self-serve, no review) and re-run the "
+            "OAuth flow with scope 'openid profile w_member_social'. "
+            "Alternatively set LINKEDIN_AUTHOR_URN to skip this call."
         )
     response.raise_for_status()
 
