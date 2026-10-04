@@ -1,0 +1,10 @@
+# Pinned on purpose. A scheduled job that only runs unattended should never
+# wake up to a different dependency tree than the one it was tested against.
+feedparser==6.0.11
+requests==2.32.3
+
+# Phase 2 (optional AI summaries). Installed always because it is small, but
+# only imported when GEMINI_API_KEY is present -- see add_summaries() in
+# src/main.py. This is the current Google GenAI SDK; the older
+# `google-generativeai` package is deprecated and no longer receives fixes.
+google-genai==1.2.0

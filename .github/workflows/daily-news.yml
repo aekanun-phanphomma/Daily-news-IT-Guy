@@ -1,0 +1,92 @@
+name: Daily DevOps News
+
+on:
+  schedule:
+    # 00:00 UTC == 07:00 Asia/Bangkok (UTC+7, no DST ever, so this never drifts
+    # seasonally). GitHub's scheduler is best-effort and queues on the hour are
+    # long, so expect the run to land a few minutes to ~30 minutes late. The
+    # bot is date-stamped, not minute-critical, so that is fine.
+    - cron: "0 0 * * *"
+  # Manual trigger from the Actions tab, for testing and for catching up a
+  # missed day.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview in the logs without posting to Discord"
+        type: boolean
+        default: false
+
+# The job pushes a commit back to the default branch. Scheduled runs cannot
+# overlap at a 24h interval, but a manual run during a scheduled one could, and
+# two jobs pushing the same file would collide.
+concurrency:
+  group: daily-news
+  cancel-in-progress: false
+
+permissions:
+  # Needed to commit the updated data/seen_urls.json. Everything else stays at
+  # the default of no access.
+  contents: write
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    # The real run takes well under a minute. This is a tripwire for a feed
+    # that accepts a connection and then never answers.
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          # setup-python can restore pip's wheel cache keyed on
+          # requirements.txt, which cuts install time to a couple of seconds.
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile check
+        # Catches a syntax error here instead of halfway through fetching feeds.
+        run: python -m compileall -q src
+
+      - name: Build and send digest
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # Optional. Absent secrets arrive as an empty string, which the
+          # script reads as "feature off".
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Lifts the GitHub Search API rate limit for the trending lookup.
+          GITHUB_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+        run: python src/main.py
+
+      - name: Commit dedup state
+        # Skipped on dry runs, and skipped entirely if the previous step failed
+        # -- no delivery means no state change, so tomorrow retries today's
+        # items rather than losing them.
+        if: success() && !inputs.dry_run
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Nothing to commit is the normal outcome on a quiet day.
+          if git diff --quiet -- data/seen_urls.json; then
+            echo "seen_urls.json unchanged - nothing to commit"
+            exit 0
+          fi
+
+          git add data/seen_urls.json
+          git commit -m "chore: update seen urls [skip ci]"
+
+          # This workflow only triggers on schedule and workflow_dispatch, so
+          # this push cannot re-trigger it. The [skip ci] tag is belt and
+          # braces for any push-triggered workflow added later.
+          git push
