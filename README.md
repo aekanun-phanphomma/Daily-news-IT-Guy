@@ -79,6 +79,7 @@ embed, and leaves `data/seen_urls.json` untouched. To send for real, set
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `DISCORD_WEBHOOK_URL` | yes | Where the digest is posted |
+| `DISCORD_FORMAT` | no | `text` (default) or `embed` — see below |
 | `DRY_RUN` | no | `1` to preview without posting or saving state |
 | `GEMINI_API_KEY` | no | Enables the Thai one-line summaries (Phase 2) |
 | `GITHUB_TOKEN` | no | Raises the GitHub Search rate limit; Actions supplies it |
@@ -109,6 +110,39 @@ guessable, so they are worth noting:
 
 A 200 response is not a working feed. The bot treats "parsed, but zero
 entries" as a failure for exactly this reason.
+
+---
+
+## Output format
+
+`DISCORD_FORMAT` picks between two renderings, and the default is the boring
+one on purpose.
+
+| | `text` (default) | `embed` |
+| --- | --- | --- |
+| Needs `Embed Links` on the channel | no | **yes** |
+| Characters per message | 2,000 | 4,096 |
+| Messages per digest | 2–3 | 1 |
+| Coloured sidebar, footer, timestamp | no | yes |
+
+A Discord webhook has no role of its own — it inherits `@everyone`'s
+permissions in the target channel. When that role is missing **Embed Links**,
+Discord accepts the POST, returns success, *keeps the embed on the message
+object*, and renders nothing. The API genuinely reports `1 embed(s) stored`
+while the channel shows a blank message. There is no response field that tells
+you this happened.
+
+That is a bad property for a bot nobody watches, so the default format is the
+one with no permission dependency.
+
+To switch to embeds: grant **Edit Channel → Permissions → @everyone → Embed
+Links**, then set `DISCORD_FORMAT: embed` in
+[.github/workflows/daily-news.yml](.github/workflows/daily-news.yml).
+
+Both formats share the delivered-items invariant described below. In `text`
+mode each message carries its own item list, so if part 2 of 3 fails, part 1's
+items are recorded as sent, parts 2 and 3 are not, and the job still exits
+non-zero.
 
 ---
 
