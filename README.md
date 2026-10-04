@@ -207,6 +207,13 @@ gh secret set GEMINI_API_KEY --body "..."     # aistudio.google.com/apikey
 Each item then gets a one-line Thai summary underneath its link. Model:
 `gemini-2.0-flash` on the free tier.
 
+**Lower `MAX_TOTAL_ITEMS` when you turn this on.** A 20-item digest without
+summaries runs ~3,800 of the 4,096 available characters, so adding a line of
+Thai per item will overflow and `build_embed()` will start cutting the tail.
+Nothing is lost when that happens — the cut items are never marked seen, so
+they arrive the next morning — but you get a lagging backlog rather than a
+same-day digest. `MAX_TOTAL_ITEMS = 10` is about right with summaries on.
+
 The code uses the **`google-genai`** SDK, not the older
 `google-generativeai` package, which is deprecated and no longer gets fixes.
 

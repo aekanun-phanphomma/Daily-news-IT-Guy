@@ -185,6 +185,21 @@ def build_session() -> requests.Session:
     return session
 
 
+def parse_iso8601(value: str | None) -> datetime:
+    """Parse a GitHub API timestamp, falling back to now on anything odd.
+
+    GitHub sends `2026-10-04T06:33:13Z`; fromisoformat only learned to accept
+    a trailing `Z` in Python 3.11, and swapping it for `+00:00` works on every
+    version.
+    """
+    if not value:
+        return datetime.now(timezone.utc)
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.now(timezone.utc)
+
+
 def entry_published(entry) -> datetime:
     """Publication time of a feedparser entry, as an aware UTC datetime.
 
@@ -323,9 +338,12 @@ def fetch_github_trending(session: requests.Session,
             link=repo["html_url"],
             source="GitHub Trending",
             category="trending",
-            # These repos are days old, not hours, so this source is exempt
-            # from MAX_AGE_HOURS (see collect_items) and stamped with now.
-            published=datetime.now(timezone.utc),
+            # The repo's real creation time, which is up to 7 days old -- so
+            # this source is exempt from MAX_AGE_HOURS (see collect_items).
+            # Stamping these with now() instead would make them all equal to
+            # the microsecond and leave the display order down to whichever
+            # loop iteration ran first.
+            published=parse_iso8601(repo.get("created_at")),
         ))
     return items
 
@@ -525,7 +543,7 @@ def shorten(text: str, limit: int = MAX_TITLE_CHARS) -> str:
     if len(text) <= limit:
         return text
     cut = text[:limit].rsplit(" ", 1)[0] or text[:limit]
-    return cut.rstrip(" ,.;:-") + "2026"
+    return cut.rstrip(" ,.;:-") + "…"
 
 
 def escape_markdown(text: str) -> str:
