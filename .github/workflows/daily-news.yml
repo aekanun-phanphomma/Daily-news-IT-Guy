@@ -57,6 +57,13 @@ jobs:
         # Catches a syntax error here instead of halfway through fetching feeds.
         run: python -m compileall -q src
 
+      - name: TEMP list gemini models
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          curl -s "https://generativelanguage.googleapis.com/v1beta/models?key=$GEMINI_API_KEY" \
+            | grep -o '"name": "models/[^"]*"' | head -40
+
       - name: Build and send digest
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
