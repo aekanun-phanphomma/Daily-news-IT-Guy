@@ -63,6 +63,11 @@ DISCORD_CONTENT_LIMIT = 2000   # plain message body; less than half an embed
 # at the cost of splitting a long digest across two or three messages.
 DISCORD_FORMAT = os.environ.get("DISCORD_FORMAT", "text").strip().lower()
 
+# Google retires Gemini model ids on a schedule, and a dead id means the
+# summaries silently stop. Overridable by env so the fix is a workflow edit
+# rather than a code change -- the API's own 404 names the replacement.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash").strip()
+
 # Bangkok is UTC+7 year round and has never observed DST, so a fixed offset is
 # correct here. Using it avoids depending on the `tzdata` package, which is not
 # bundled with CPython on Windows.
@@ -558,7 +563,7 @@ def add_summaries(items: list[NewsItem]) -> None:
     try:
         client = genai.Client(api_key=api_key)
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model=GEMINI_MODEL,
             contents=prompt,
         )
         text = (response.text or "").strip()

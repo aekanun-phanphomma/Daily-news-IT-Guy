@@ -239,7 +239,13 @@ gh secret set GEMINI_API_KEY --body "..."     # aistudio.google.com/apikey
 ```
 
 Each item then gets a one-line Thai summary underneath its link. Model:
-`gemini-2.0-flash` on the free tier.
+`gemini-3.8-flash` on the free tier, overridable with `GEMINI_MODEL`.
+
+Google retires model ids on a schedule — `gemini-2.0-flash` was already gone
+when this was first wired up. A dead id makes the summaries stop without the
+digest failing, so it shows up as a `WARNING` in the job log rather than a red
+X. The API's 404 names its own replacement, and `GEMINI_MODEL` means acting on
+that is a workflow edit, not a code change.
 
 **Lower `MAX_TOTAL_ITEMS` when you turn this on.** A 20-item digest without
 summaries runs ~3,800 of the 4,096 available characters, so adding a line of
