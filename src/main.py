@@ -67,6 +67,7 @@ DISCORD_FORMAT = os.environ.get("DISCORD_FORMAT", "text").strip().lower()
 # summaries silently stop. Overridable by env so the fix is a workflow edit
 # rather than a code change -- the API's own 404 names the replacement.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash").strip()
+GEMINI_ATTEMPTS = 3         # the free tier returns 503 "high demand" regularly
 
 # Bangkok is UTC+7 year round and has never observed DST, so a fixed offset is
 # correct here. Using it avoids depending on the `tzdata` package, which is not
@@ -560,15 +561,34 @@ def add_summaries(items: list[NewsItem]) -> None:
         f"{numbered}"
     )
 
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
-        text = (response.text or "").strip()
-    except Exception as exc:
-        log.warning("Gemini summaries: skipped (%s)", exc)
+    # The free tier returns 503 "high demand" fairly often, and a one-shot
+    # attempt means a transient spike costs a whole day of Thai summaries.
+    # Retrying is cheap -- the whole job has a 2-minute budget and normally
+    # finishes in 20 seconds -- but only for failures that might clear.
+    # A retired model id (404) will never succeed, so it fails immediately.
+    text = ""
+    for attempt in range(1, GEMINI_ATTEMPTS + 1):
+        try:
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
+            text = (response.text or "").strip()
+            break
+        except Exception as exc:
+            transient = any(code in str(exc) for code in ("429", "500", "502",
+                                                          "503", "504"))
+            if not transient or attempt == GEMINI_ATTEMPTS:
+                log.warning("Gemini summaries: skipped (%s)", exc)
+                return
+            delay = 2 ** attempt          # 2s, 4s, 8s
+            log.warning("Gemini attempt %d/%d failed, retrying in %ds (%s)",
+                        attempt, GEMINI_ATTEMPTS, delay, type(exc).__name__)
+            time.sleep(delay)
+
+    if not text:
+        log.warning("Gemini summaries: skipped (empty response)")
         return
 
     # Map "3. <summary>" back onto items[2]. Lines we cannot parse are dropped.
