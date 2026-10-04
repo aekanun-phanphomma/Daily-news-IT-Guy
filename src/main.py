@@ -101,6 +101,14 @@ GEMINI_ATTEMPTS = 3         # the free tier returns 503 "high demand" regularly
 LINKEDIN_TEXT_LIMIT = 3000
 # Retired on a rolling schedule; a stale value answers 426, not 200.
 LINKEDIN_VERSION = os.environ.get("LINKEDIN_VERSION", "202601").strip()
+# English section headings, and no emoji anywhere in the post. LinkedIn has no
+# markdown, so uppercase is the only emphasis available -- and a briefing in a
+# professional feed reads better plain than it does decorated.
+PRIORITIES_EN: dict[str, str] = {
+    "ACTION": "ACTION REQUIRED",
+    "WATCH": "WORTH WATCHING",
+    "FYI": "GOOD TO KNOW",
+}
 LINKEDIN_HASHTAGS = (
     "#DevOps", "#Kubernetes", "#Azure", "#AWS",
     "#CloudNative", "#SRE", "#PlatformEngineering",
@@ -281,7 +289,13 @@ class NewsItem:
     source: str
     category: str
     published: datetime
+    # `summary` is what Discord shows and gets overwritten with Thai.
+    # `summary_en` is what LinkedIn shows. Both start life as the feed's own
+    # English blurb, so if either Gemini pass fails the channel still has a
+    # sentence in the right language rather than falling back to the other
+    # one's.
     summary: str | None = None
+    summary_en: str | None = None
     # Filled by rank_items() when Gemini is available. score drives what makes
     # the cut; priority drives how the digest is grouped.
     score: float = 0.0
@@ -432,7 +446,11 @@ def fetch_rss(session: requests.Session, feed: dict[str, str]) -> list[NewsItem]
             source=feed["name"],
             category=feed["category"],
             published=entry_published(entry),
+            # Same text in both to start. The two Gemini passes then replace
+            # them independently, so a failure in one language cannot leave
+            # the other channel showing the wrong one.
             summary=entry_summary(entry),
+            summary_en=entry_summary(entry),
         ))
     return items
 
@@ -523,6 +541,8 @@ def fetch_github_trending(session: requests.Session,
             title=f"{repo['full_name']} ⭐ {repo.get('stargazers_count', 0)}",
             summary=shorten(clean_html(repo.get("description") or ""),
                             MAX_SUMMARY_CHARS),
+            summary_en=shorten(clean_html(repo.get("description") or ""),
+                               MAX_SUMMARY_CHARS),
             link=repo["html_url"],
             source="GitHub Trending",
             category="trending",
@@ -821,6 +841,54 @@ def rank_items(items: list[NewsItem],
         if count:
             log.info("triage: %-6s %d item(s)", level, count)
     return kept
+
+
+def add_summaries_en(items: list[NewsItem]) -> None:
+    """Attach a formal English summary to each item, in place.
+
+    Must run *before* add_summaries(), which overwrites `summary` with Thai.
+    Both read the feed's original blurb, so the English pass has to go first
+    or it would be translating Thai back to English.
+
+    Only called when LinkedIn is configured -- no point spending a Gemini
+    request on text nothing will display.
+    """
+    if not items:
+        return
+
+    numbered = "\n".join(
+        f"{n}. {item.title}" + (f" | {item.summary}" if item.summary else "")
+        for n, item in enumerate(items, 1)
+    )
+    prompt = (
+        "You are a senior platform engineer writing a daily briefing that "
+        "will be published on LinkedIn for a professional audience of "
+        "DevOps, SRE, platform and security engineers running Azure, AWS "
+        "and Kubernetes.\n\n"
+        "Summarize each item in one or two sentences of formal English, "
+        "maximum 180 characters. Each summary must convey both:\n"
+        "1) what specifically changed -- not a restatement of the headline\n"
+        "2) what teams should do about it: patch, upgrade, plan a migration, "
+        "evaluate as a replacement, or simply be aware\n\n"
+        "Write in a measured, professional register. No marketing language, "
+        "no hype, no exclamation marks, no first person, no emoji. "
+        "For vulnerabilities, state plainly whether urgent patching is "
+        "warranted.\n\n"
+        "Reply as a numbered list only, one item per line, in the format "
+        "\"<number>. <summary>\". Add no other text.\n\n"
+        f"{numbered}"
+    )
+
+    text = gemini_generate(prompt, "summaries/en")
+    if not text:
+        return   # the feed's own English blurb is still in summary_en
+
+    filled = 0
+    for index, summary in parse_numbered(text, len(items)).items():
+        items[index].summary_en = shorten(summary, MAX_SUMMARY_CHARS)
+        filled += 1
+
+    log.info("Gemini summaries/en: %d/%d item(s)", filled, len(items))
 
 
 def add_summaries(items: list[NewsItem]) -> None:
@@ -1213,8 +1281,8 @@ def render_linkedin(items: list[NewsItem]) -> str:
     Items are added whole until the budget runs out. Everything here was
     already sent to the primary channel, so dropping the tail costs nothing.
     """
-    today = datetime.now(BANGKOK).strftime("%Y-%m-%d")
-    header = f"\U0001F4CB Daily DevOps & Infra News — {today}"
+    today = datetime.now(BANGKOK).strftime("%d %B %Y")
+    header = f"Daily DevOps & Infrastructure Briefing — {today}"
     footer = "\n" + " ".join(LINKEDIN_HASHTAGS)
 
     budget = LINKEDIN_TEXT_LIMIT - len(header) - len(footer) - 8
@@ -1228,23 +1296,27 @@ def render_linkedin(items: list[NewsItem]) -> str:
         if ranked:
             group = [i for i in items if (i.priority or "FYI") == key]
             group.sort(key=lambda i: (i.score, i.published), reverse=True)
+            heading = PRIORITIES_EN.get(key, key)
         else:
             group = [i for i in items if i.category == key]
             group.sort(key=lambda i: i.published, reverse=True)
+            heading = meta["label"].upper()
         if not group:
             continue
 
-        section: list[str] = [f"\n{meta['emoji']} {escape_linkedin(meta['label'])}"]
+        section: list[str] = [f"\n{escape_linkedin(heading)}"]
         section_cost = len(section[0]) + 1
         wrote_any = False
 
         for item in group:
             block = (
                 f"\n• {escape_linkedin(shorten(item.title, 110))}"
-                f"\n  {escape_linkedin(item.link)}"
             )
-            if item.summary:
-                block += f"\n  {escape_linkedin(item.summary)}"
+            # English only. summary_en holds the feed's own blurb when the
+            # Gemini pass did not run, so this is never the Thai text.
+            if item.summary_en:
+                block += f"\n  {escape_linkedin(item.summary_en)}"
+            block += f"\n  {escape_linkedin(item.link)}"
             if used + section_cost + len(block) + 1 > budget:
                 break
             section.append(block)
@@ -1405,6 +1477,10 @@ def main() -> int:
     log.info("sending %d item(s) (cap %d, from %d candidate(s))",
              len(picked), MAX_TOTAL_ITEMS, len(candidates))
 
+    # English first: both passes read the feed's original blurb, and
+    # add_summaries() overwrites it with Thai.
+    if os.environ.get("LINKEDIN_ACCESS_TOKEN", "").strip() or dry_run:
+        add_summaries_en(picked)
     add_summaries(picked)
     log.info("output format: %s", DISCORD_FORMAT)
 
