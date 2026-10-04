@@ -63,16 +63,24 @@ DISCORD_CONTENT_LIMIT = 2000   # plain message body; less than half an embed
 # at the cost of splitting a long digest across two or three messages.
 DISCORD_FORMAT = os.environ.get("DISCORD_FORMAT", "text").strip().lower()
 
-# Not the newest model on purpose. gemini-3.8-flash was the latest release and
-# returned 503 "high demand" on every attempt across several runs -- newest
-# means most contended. Turning a headline into one Thai line is not a job that
-# needs a frontier model, and a mature one has far more capacity to serve it.
+# A list, not one id, because neither availability nor load is predictable:
+# gemini-2.5-flash is still listed by the API but 404s for keys created after
+# it was closed to new users, while gemini-3.8-flash is the newest release and
+# therefore the most contended -- it returned 503 on every attempt. The list is
+# tried in order and the first model that answers wins.
 #
-# Google also retires model ids on a schedule, and a dead id stops the
-# summaries silently. Overridable by env so the fix is a workflow edit rather
-# than a code change; the API's own 404 names the replacement, and
-# GET /v1beta/models?key=... lists what is currently served.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
+# Lite variants come first deliberately. Turning a headline into one Thai line
+# does not need a frontier model, and the smaller tiers are far less busy.
+#
+# GET https://generativelanguage.googleapis.com/v1beta/models?key=... lists
+# what the API currently serves, though note that being listed is not the same
+# as being available to your key.
+GEMINI_MODELS = [
+    m.strip() for m in os.environ.get(
+        "GEMINI_MODEL",
+        "gemini-3.5-flash-lite,gemini-3.5-flash,gemini-3.7-flash,gemini-3.8-flash",
+    ).split(",") if m.strip()
+]
 GEMINI_ATTEMPTS = 3         # the free tier returns 503 "high demand" regularly
 
 # Bangkok is UTC+7 year round and has never observed DST, so a fixed offset is
@@ -567,34 +575,50 @@ def add_summaries(items: list[NewsItem]) -> None:
         f"{numbered}"
     )
 
-    # The free tier returns 503 "high demand" fairly often, and a one-shot
-    # attempt means a transient spike costs a whole day of Thai summaries.
-    # Retrying is cheap -- the whole job has a 2-minute budget and normally
-    # finishes in 20 seconds -- but only for failures that might clear.
-    # A retired model id (404) will never succeed, so it fails immediately.
+    # Two different failures, two different responses, learned the hard way:
+    #
+    #   503 "high demand"  -- transient, and the newest model gets it most.
+    #                         Retry the same model with backoff.
+    #   404 "not available" -- permanent for this key. Retrying is pointless;
+    #                         move to the next model in the list.
+    #
+    # Neither is predictable from the outside. A model can be listed by the
+    # API and still 404 ("no longer available to new users"), and which model
+    # is saturated changes by the hour. So the config is a list, tried in
+    # order, rather than a single id someone has to keep correcting.
     text = ""
-    for attempt in range(1, GEMINI_ATTEMPTS + 1):
-        try:
-            client = genai.Client(api_key=api_key)
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-            )
-            text = (response.text or "").strip()
+    client = genai.Client(api_key=api_key)
+
+    for model in GEMINI_MODELS:
+        for attempt in range(1, GEMINI_ATTEMPTS + 1):
+            try:
+                response = client.models.generate_content(
+                    model=model, contents=prompt,
+                )
+                text = (response.text or "").strip()
+                break
+            except Exception as exc:
+                transient = any(code in str(exc)
+                                for code in ("429", "500", "502", "503", "504"))
+                if not transient:
+                    log.warning("Gemini: %s unusable, trying next (%s)",
+                                model, str(exc)[:120])
+                    break
+                if attempt == GEMINI_ATTEMPTS:
+                    log.warning("Gemini: %s still failing after %d attempts",
+                                model, GEMINI_ATTEMPTS)
+                    break
+                delay = 2 ** attempt          # 2s, 4s
+                log.warning("Gemini: %s attempt %d/%d failed, retrying in %ds",
+                            model, attempt, GEMINI_ATTEMPTS, delay)
+                time.sleep(delay)
+        if text:
+            log.info("Gemini: using %s", model)
             break
-        except Exception as exc:
-            transient = any(code in str(exc) for code in ("429", "500", "502",
-                                                          "503", "504"))
-            if not transient or attempt == GEMINI_ATTEMPTS:
-                log.warning("Gemini summaries: skipped (%s)", exc)
-                return
-            delay = 2 ** attempt          # 2s, 4s, 8s
-            log.warning("Gemini attempt %d/%d failed, retrying in %ds (%s)",
-                        attempt, GEMINI_ATTEMPTS, delay, type(exc).__name__)
-            time.sleep(delay)
 
     if not text:
-        log.warning("Gemini summaries: skipped (empty response)")
+        log.warning("Gemini summaries: skipped (no model in %s would answer)",
+                    ", ".join(GEMINI_MODELS))
         return
 
     # Map "3. <summary>" back onto items[2]. Lines we cannot parse are dropped.
