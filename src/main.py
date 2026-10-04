@@ -44,13 +44,16 @@ from urllib3.util.retry import Retry
 
 MAX_AGE_HOURS = 48          # ignore anything older than this
 MAX_ITEMS_PER_FEED = 5      # stop one chatty feed from owning the digest
-# Dropped from 20 when per-item summaries were added. A summary roughly
-# doubles the space an item takes, and 20 summarized items spill into four
-# Discord messages every morning, which is spam rather than a digest.
-MAX_TOTAL_ITEMS = 12
+# Three per category across the eight categories. Raising this costs messages,
+# not minutes: a summarized item is ~380 characters and a Discord message holds
+# 2,000, so every three extra items is roughly one more message in the morning.
+MAX_TOTAL_ITEMS = 24
 MAX_SEEN_HASHES = 2000      # bound the dedup file so the repo stays small
 MAX_TITLE_CHARS = 180       # one verbose headline should not own three lines
-MAX_SUMMARY_CHARS = 120     # one line under the headline, not a paragraph
+# Room for "what changed" plus "what to do about it". The feed's own blurb gets
+# cut to this as well, which is fine -- it is only the fallback when Gemini is
+# not configured or not answering.
+MAX_SUMMARY_CHARS = 240
 
 HTTP_TIMEOUT = 15           # seconds, per request
 DISCORD_EMBED_DESC_LIMIT = 4096
@@ -103,6 +106,9 @@ CATEGORIES: dict[str, dict[str, str]] = {
     "cloud":    {"emoji": "\u2601\ufe0f", "label": "Cloud & Infrastructure"},
     "platform": {"emoji": "\U0001F680",   "label": "Platform & Kubernetes"},
     "devops":   {"emoji": "\U0001F6E0\ufe0f", "label": "DevOps & IaC"},
+    "data":     {"emoji": "\U0001F4BE",   "label": "Data & Streaming"},
+    "observe":  {"emoji": "\U0001F4CA",   "label": "Observability"},
+    "ai":       {"emoji": "\U0001F916",   "label": "AI & Models"},
     "security": {"emoji": "\U0001F512",   "label": "Security"},
     "trending": {"emoji": "\U0001F525",   "label": "Trending"},
 }
@@ -119,6 +125,10 @@ FEEDS: list[dict[str, str]] = [
      # cloud.google.com/blog/feed answers 200 with HTML, not RSS; this is the
      # real feed behind the same blog.
      "url": "https://cloudblog.withgoogle.com/rss/"},
+    {"name": "AWS Architecture", "category": "cloud",
+     "url": "https://aws.amazon.com/blogs/architecture/feed/"},
+    {"name": "Cloudflare Blog", "category": "cloud",
+     "url": "https://blog.cloudflare.com/rss/"},
     # Platform & Kubernetes
     {"name": "Kubernetes Blog", "category": "platform",
      "url": "https://kubernetes.io/feed.xml"},
@@ -126,6 +136,8 @@ FEEDS: list[dict[str, str]] = [
      "url": "https://www.cncf.io/blog/feed/"},
     {"name": "Istio Blog", "category": "platform",
      "url": "https://istio.io/latest/blog/feed.xml"},
+    {"name": "The New Stack", "category": "platform",
+     "url": "https://thenewstack.io/feed/"},
     # DevOps & IaC
     {"name": "HashiCorp Blog", "category": "devops",
      "url": "https://www.hashicorp.com/blog/feed.xml"},
@@ -133,6 +145,39 @@ FEEDS: list[dict[str, str]] = [
      "url": "https://www.docker.com/blog/feed/"},
     {"name": "GitHub Blog", "category": "devops",
      "url": "https://github.blog/feed/"},
+    {"name": "GitLab Blog", "category": "devops",
+     "url": "https://about.gitlab.com/atom.xml"},
+    {"name": "AWS DevOps Blog", "category": "devops",
+     "url": "https://aws.amazon.com/blogs/devops/feed/"},
+    {"name": "Azure DevOps Blog", "category": "devops",
+     "url": "https://devblogs.microsoft.com/devops/feed/"},
+    # Data & Streaming
+    {"name": "Redis Blog", "category": "data",
+     "url": "https://redis.io/blog/feed/"},
+    {"name": "Confluent (Kafka)", "category": "data",
+     # confluent.io/blog/feed/ and kafka.apache.org/blog.rss both 404; the
+     # site-wide feed is the one that actually serves.
+     "url": "https://www.confluent.io/feed/"},
+    {"name": "Elastic Blog", "category": "data",
+     "url": "https://www.elastic.co/blog/feed"},
+    {"name": "PostgreSQL News", "category": "data",
+     "url": "https://www.postgresql.org/news.rss"},
+    # Observability
+    {"name": "Grafana Blog", "category": "observe",
+     "url": "https://grafana.com/blog/index.xml"},
+    {"name": "Prometheus Blog", "category": "observe",
+     "url": "https://prometheus.io/blog/feed.xml"},
+    {"name": "OpenTelemetry Blog", "category": "observe",
+     "url": "https://opentelemetry.io/blog/index.xml"},
+    {"name": "Datadog Blog", "category": "observe",
+     "url": "https://www.datadoghq.com/blog/index.xml"},
+    # AI & Models
+    {"name": "OpenAI News", "category": "ai",
+     "url": "https://openai.com/news/rss.xml"},
+    {"name": "Hugging Face Blog", "category": "ai",
+     "url": "https://huggingface.co/blog/feed.xml"},
+    {"name": "Google DeepMind", "category": "ai",
+     "url": "https://deepmind.google/blog/rss.xml"},
     # Security
     {"name": "The Hacker News", "category": "security",
      "url": "https://feeds.feedburner.com/TheHackersNews"},
@@ -559,19 +604,25 @@ def add_summaries(items: list[NewsItem]) -> None:
         f"{n}. {item.title}" + (f" | {item.summary}" if item.summary else "")
         for n, item in enumerate(items, 1)
     )
+    # The summary is asked to answer "so what?", not just restate the headline.
+    # A reader at 7am already has the title in front of them; what they do not
+    # have is whether it affects their stack and what to do about it.
     prompt = (
-        "สรุปพาดหัวข่าว"
-        "ไอทีเหล่านี้เป็น"
-        "ภาษาไทย หัวข้อละ 1 "
-        "บรรทัดสั้นๆ "
-        "(ไม่เกิน 100 "
-        "ตัวอักษร)\n"
-        "ตอบเป็นรายการ"
-        "ตัวเลขเท่านั้น "
-        "รูปแบบ \"<เลข>. <สรุป>\" "
-        "บรรทัดละ 1 "
-        "ข่าว ห้ามใส่"
-        "ข้อความอื่น\n\n"
+        "คุณเป็น Senior DevOps/Platform Engineer "
+        "สรุปข่าวไอทีต่อไปนี้ให้ทีม DevOps/Infra/Security ที่ทำงานบน "
+        "AWS, Azure, Kubernetes, Terraform, Istio\n\n"
+        "แต่ละข่าวสรุปเป็นภาษาไทย 1-2 ประโยค ไม่เกิน 200 ตัวอักษร "
+        "โดยต้องบอกทั้ง 2 อย่างนี้:\n"
+        "1) มีอะไรใหม่/เปลี่ยนไปอย่างไร (เจาะจง ไม่ใช่แค่แปลหัวข้อ)\n"
+        "2) ทีมเอาไปใช้ประโยชน์อย่างไร หรือควรทำอะไรต่อ "
+        "เช่น ควรอัปเกรด ควรแพตช์ด่วน ควรลองใช้แทนของเดิม "
+        "หรือแค่รับรู้ไว้เฉยๆ\n\n"
+        "เขียนติดกันเป็นประโยคเดียว ห้ามขึ้นบรรทัดใหม่ "
+        "ห้ามใส่หัวข้อย่อยหรือ bullet ในแต่ละข้อ\n"
+        "ถ้าข่าวไหนเป็นเรื่องช่องโหว่หรือความปลอดภัย "
+        "ให้ระบุชัดว่าต้องรีบแพตช์หรือไม่\n\n"
+        "ตอบเป็นรายการตัวเลขเท่านั้น รูปแบบ \"<เลข>. <สรุป>\" "
+        "บรรทัดละ 1 ข่าว ห้ามใส่ข้อความอื่น\n\n"
         f"{numbered}"
     )
 
@@ -633,7 +684,10 @@ def add_summaries(items: list[NewsItem]) -> None:
         index = int(index_text.strip()) - 1
         summary = summary.strip()
         if 0 <= index < len(items) and summary:
-            items[index].summary = summary
+            # The prompt asks for 200 characters, but a model asked for a
+            # length is not a model held to one. Trim rather than let one long
+            # answer push several items out of the digest entirely.
+            items[index].summary = shorten(summary, MAX_SUMMARY_CHARS)
             filled += 1
 
     log.info("Gemini summaries: %d/%d item(s) summarized", filled, len(items))
