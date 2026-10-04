@@ -63,10 +63,16 @@ DISCORD_CONTENT_LIMIT = 2000   # plain message body; less than half an embed
 # at the cost of splitting a long digest across two or three messages.
 DISCORD_FORMAT = os.environ.get("DISCORD_FORMAT", "text").strip().lower()
 
-# Google retires Gemini model ids on a schedule, and a dead id means the
-# summaries silently stop. Overridable by env so the fix is a workflow edit
-# rather than a code change -- the API's own 404 names the replacement.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash").strip()
+# Not the newest model on purpose. gemini-3.8-flash was the latest release and
+# returned 503 "high demand" on every attempt across several runs -- newest
+# means most contended. Turning a headline into one Thai line is not a job that
+# needs a frontier model, and a mature one has far more capacity to serve it.
+#
+# Google also retires model ids on a schedule, and a dead id stops the
+# summaries silently. Overridable by env so the fix is a workflow edit rather
+# than a code change; the API's own 404 names the replacement, and
+# GET /v1beta/models?key=... lists what is currently served.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
 GEMINI_ATTEMPTS = 3         # the free tier returns 503 "high demand" regularly
 
 # Bangkok is UTC+7 year round and has never observed DST, so a fixed offset is

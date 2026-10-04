@@ -239,7 +239,7 @@ gh secret set GEMINI_API_KEY --body "..."     # aistudio.google.com/apikey
 ```
 
 Each item then gets a one-line Thai summary underneath its link. Model:
-`gemini-3.8-flash` on the free tier, overridable with `GEMINI_MODEL`.
+`gemini-2.5-flash` on the free tier, overridable with `GEMINI_MODEL`.
 
 Google retires model ids on a schedule — `gemini-2.0-flash` was already gone
 when this was first wired up. A dead id makes the summaries stop without the
