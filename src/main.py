@@ -89,6 +89,23 @@ GEMINI_MODELS = [
 ]
 GEMINI_ATTEMPTS = 3         # the free tier returns 503 "high demand" regularly
 
+# LinkedIn. Secondary channel: Discord is what drives the dedup state, so a
+# LinkedIn outage never costs a day of news (see main()).
+#
+# The access token is the operational catch. Standard apps using
+# w_member_social get a token that expires 60 days after it is issued and no
+# refresh token to renew it with -- programmatic refresh is reserved for
+# approved Marketing Developer Platform partners. There is no way to automate
+# around that, so the job is built to fail loudly on 401 instead of going
+# quiet. Put a calendar reminder at day 55.
+LINKEDIN_TEXT_LIMIT = 3000
+# Retired on a rolling schedule; a stale value answers 426, not 200.
+LINKEDIN_VERSION = os.environ.get("LINKEDIN_VERSION", "202601").strip()
+LINKEDIN_HASHTAGS = (
+    "#DevOps", "#Kubernetes", "#Azure", "#AWS",
+    "#CloudNative", "#SRE", "#PlatformEngineering",
+)
+
 # Bangkok is UTC+7 year round and has never observed DST, so a fixed offset is
 # correct here. Using it avoids depending on the `tzdata` package, which is not
 # bundled with CPython on Windows.
@@ -1160,6 +1177,174 @@ def send_discord(session: requests.Session, webhook_url: str, embed: dict) -> No
 # Entry point
 # --------------------------------------------------------------------------
 
+
+
+# --------------------------------------------------------------------------
+# LinkedIn
+# --------------------------------------------------------------------------
+
+def escape_linkedin(text: str) -> str:
+    """Escape LinkedIn's "little text format" reserved characters.
+
+    The Posts API parses `commentary` for inline entities, so every reserved
+    character has to be backslash-escaped even when it is plain punctuation --
+    an unescaped one is a 422, not a rendering quirk. The backslash itself is
+    escaped first, or the escapes we add would then be re-escaped.
+
+    URLs get the same treatment. The `_` and `#` inside them are escaped, the
+    backslashes are stripped at render time, and LinkedIn still auto-links the
+    result.
+    """
+    text = text.replace("\\", "\\\\")
+    for char in "|{}@[]()<>#*_~":
+        text = text.replace(char, "\\" + char)
+    return text
+
+
+def render_linkedin(items: list[NewsItem]) -> str:
+    """One LinkedIn post, plain text, inside LINKEDIN_TEXT_LIMIT.
+
+    Deliberately not the Discord renderer. LinkedIn has no markdown: `**bold**`
+    shows up as literal asterisks and `[title](url)` as literal brackets, so
+    the layout has to carry the structure instead -- section headings on their
+    own line, the URL bare underneath each item where LinkedIn will auto-link
+    it.
+
+    Items are added whole until the budget runs out. Everything here was
+    already sent to the primary channel, so dropping the tail costs nothing.
+    """
+    today = datetime.now(BANGKOK).strftime("%Y-%m-%d")
+    header = f"\U0001F4CB Daily DevOps & Infra News — {today}"
+    footer = "\n" + " ".join(LINKEDIN_HASHTAGS)
+
+    budget = LINKEDIN_TEXT_LIMIT - len(header) - len(footer) - 8
+    parts: list[str] = []
+    used = 0
+
+    ranked = any(i.priority for i in items)
+    groups = PRIORITIES if ranked else CATEGORIES
+
+    for key, meta in groups.items():
+        if ranked:
+            group = [i for i in items if (i.priority or "FYI") == key]
+            group.sort(key=lambda i: (i.score, i.published), reverse=True)
+        else:
+            group = [i for i in items if i.category == key]
+            group.sort(key=lambda i: i.published, reverse=True)
+        if not group:
+            continue
+
+        section: list[str] = [f"\n{meta['emoji']} {escape_linkedin(meta['label'])}"]
+        section_cost = len(section[0]) + 1
+        wrote_any = False
+
+        for item in group:
+            block = (
+                f"\n• {escape_linkedin(shorten(item.title, 110))}"
+                f"\n  {escape_linkedin(item.link)}"
+            )
+            if item.summary:
+                block += f"\n  {escape_linkedin(item.summary)}"
+            if used + section_cost + len(block) + 1 > budget:
+                break
+            section.append(block)
+            section_cost += len(block) + 1
+            wrote_any = True
+
+        if wrote_any:
+            parts.extend(section)
+            used += section_cost
+
+    return header + "\n" + "\n".join(parts) + "\n" + footer
+
+
+def linkedin_author(session: requests.Session, token: str) -> str:
+    """The URN to post as.
+
+    LINKEDIN_AUTHOR_URN short-circuits this. Otherwise the OpenID userinfo
+    endpoint gives the member id, which is the only thing `w_member_social`
+    can post on behalf of -- a company page needs a different scope entirely.
+    """
+    configured = os.environ.get("LINKEDIN_AUTHOR_URN", "").strip()
+    if configured:
+        return configured
+
+    response = session.get(
+        "https://api.linkedin.com/v2/userinfo",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=HTTP_TIMEOUT,
+    )
+    if response.status_code == 401:
+        raise RuntimeError(
+            "LinkedIn rejected the token (401). These expire 60 days after "
+            "they are issued and standard apps get no refresh token, so this "
+            "is almost certainly expiry -- re-run the OAuth flow and update "
+            "the LINKEDIN_ACCESS_TOKEN secret. See the README."
+        )
+    response.raise_for_status()
+
+    member_id = response.json().get("sub")
+    if not member_id:
+        raise RuntimeError(f"no 'sub' in userinfo: {response.text[:200]}")
+    return f"urn:li:person:{member_id}"
+
+
+def send_linkedin(session: requests.Session, items: list[NewsItem]) -> None:
+    """Post the digest to LinkedIn. Raises with a readable reason on failure."""
+    token = os.environ.get("LINKEDIN_ACCESS_TOKEN", "").strip()
+    if not token:
+        log.info("LinkedIn: skipped (no LINKEDIN_ACCESS_TOKEN)")
+        return
+
+    author = linkedin_author(session, token)
+    text = render_linkedin(items)
+    log.info("LinkedIn: posting as %s (%d/%d chars)",
+             author, len(text), LINKEDIN_TEXT_LIMIT)
+
+    response = session.post(
+        "https://api.linkedin.com/rest/posts",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            # Both headers are mandatory on the versioned API. The version is
+            # env-configurable because LinkedIn retires them on a rolling
+            # schedule and a stale one answers 426, not 200.
+            "LinkedIn-Version": LINKEDIN_VERSION,
+            "X-Restli-Protocol-Version": "2.0.0",
+        },
+        json={
+            "author": author,
+            "commentary": text,
+            "visibility": "PUBLIC",
+            "distribution": {
+                "feedDistribution": "MAIN_FEED",
+                "targetEntities": [],
+                "thirdPartyDistributionChannels": [],
+            },
+            "lifecycleState": "PUBLISHED",
+            "isReshareDisabledByAuthor": False,
+        },
+        timeout=HTTP_TIMEOUT,
+    )
+
+    if response.status_code == 401:
+        raise RuntimeError(
+            "LinkedIn rejected the token (401) -- almost certainly the 60-day "
+            "expiry. Re-run the OAuth flow and update LINKEDIN_ACCESS_TOKEN."
+        )
+    if response.status_code == 426:
+        raise RuntimeError(
+            f"LinkedIn rejected version {LINKEDIN_VERSION} (426). Set the "
+            f"LINKEDIN_VERSION env to a current YYYYMM value. Body: "
+            f"{response.text[:200]}"
+        )
+    if response.status_code not in (200, 201):
+        raise RuntimeError(
+            f"LinkedIn returned {response.status_code}: {response.text[:400]}"
+        )
+
+    post_id = response.headers.get("x-restli-id", "?")
+    log.info("LinkedIn: posted (%s)", post_id)
 def main() -> int:
     # Windows consoles default to a legacy code page and would crash on the
     # emoji in these log lines. Harmless no-op on the Linux runner.
@@ -1219,6 +1404,11 @@ def main() -> int:
                       f"({len(text)}/{DISCORD_CONTENT_LIMIT} chars, "
                       f"{len(chunk_items)} item(s)) -----")
                 print(text)
+            if os.environ.get("LINKEDIN_ACCESS_TOKEN", "").strip():
+                preview = render_linkedin(picked)
+                print(f"\n----- DRY RUN: LinkedIn "
+                      f"({len(preview)}/{LINKEDIN_TEXT_LIMIT} chars) -----")
+                print(preview)
             log.info("DRY_RUN=1 — not posting and not updating seen_urls.json")
             return 0
 
@@ -1250,6 +1440,18 @@ def main() -> int:
     save_seen(SEEN_PATH, seen + [item.hash for item in delivered])
     log.info("recorded %d hash(es) to %s",
              len(delivered), SEEN_PATH.relative_to(REPO_ROOT))
+
+    # Secondary channels run after the state is already safe. Discord is what
+    # dedup is keyed on, so a LinkedIn failure must never cause today's items
+    # to be sent to Discord again tomorrow -- but it must still be visible,
+    # because the most likely cause is a 60-day token expiry that only a human
+    # can fix. Hence: record state, then fail the job anyway.
+    try:
+        send_linkedin(session, delivered)
+    except Exception as exc:
+        log.error("LinkedIn: %s", exc)
+        return 1
+
     return 0
 
 

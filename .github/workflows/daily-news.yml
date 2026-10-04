@@ -70,13 +70,22 @@ jobs:
           # format once the channel grants Embed Links to @everyone -- see the
           # output format section of the README.
           DISCORD_FORMAT: text
+          # Optional secondary channel. The token expires 60 days after it is
+          # issued and standard apps get no refresh token, so expect to rotate
+          # this by hand -- a 401 fails the job on purpose rather than going
+          # quiet. See the LinkedIn section of the README.
+          LINKEDIN_ACCESS_TOKEN: ${{ secrets.LINKEDIN_ACCESS_TOKEN }}
+          LINKEDIN_AUTHOR_URN: ${{ secrets.LINKEDIN_AUTHOR_URN }}
         run: python src/main.py
 
       - name: Commit dedup state
-        # Skipped on dry runs, and skipped entirely if the previous step failed
-        # -- no delivery means no state change, so tomorrow retries today's
-        # items rather than losing them.
-        if: success() && !inputs.dry_run
+        # Deliberately not `success()`. The script writes seen_urls.json itself
+        # and only after the primary channel confirms delivery, so if the file
+        # changed, those items really were sent and the state must be kept --
+        # even when a later step (LinkedIn, say) failed the job. Using
+        # success() here would resend a whole day of Discord items tomorrow
+        # because a secondary channel's token expired.
+        if: ${{ !cancelled() && !inputs.dry_run }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

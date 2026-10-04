@@ -5,7 +5,7 @@ news every morning at **07:00 Bangkok time**. No server, no database, no
 container, and no bill — it runs entirely on GitHub Actions' free tier.
 
 ```text
-13 RSS feeds + Hacker News API + GitHub Search API
+40 sources: RSS + GitHub release feeds + Hacker News & GitHub Search APIs
         │
         ▼
 GitHub Actions (cron: 0 0 * * *  ==  07:00 ICT)
@@ -13,16 +13,21 @@ GitHub Actions (cron: 0 0 * * *  ==  07:00 ICT)
         ├─ 1. fetch every source (failures are logged and skipped)
         ├─ 2. drop anything older than 48h
         ├─ 3. drop anything already in data/seen_urls.json
-        ├─ 4. pick ≤20 items, round-robin across categories
-        ├─ 5. (optional) one-line Thai summaries via Gemini
-        └─ 6. POST one embed to the Discord webhook
+        ├─ 4. round-robin to a balanced pool of ≤60 candidates
+        ├─ 5. AI triage: score 0-10, label ACTION / WATCH / FYI, keep 14
+        ├─ 6. AI summary: what changed + what the team should do
+        └─ 7. POST to Discord, grouped by priority
         │
         ▼
-#daily-devops-news
+Discord  (+ LinkedIn, optional)
         │
         ▼
 commit the updated data/seen_urls.json back to main
 ```
+
+The point of steps 4–6 is that this is a triage tool, not a feed reader.
+Recency cannot tell a Kubernetes deprecation that breaks your cluster in 90
+days from a conference announcement posted the same hour; the ranker can.
 
 ---
 
@@ -81,8 +86,16 @@ embed, and leaves `data/seen_urls.json` untouched. To send for real, set
 | `DISCORD_WEBHOOK_URL` | yes | Where the digest is posted |
 | `DISCORD_FORMAT` | no | `text` (default) or `embed` — see below |
 | `DRY_RUN` | no | `1` to preview without posting or saving state |
-| `GEMINI_API_KEY` | no | Enables the Thai one-line summaries (Phase 2) |
+| `GEMINI_API_KEY` | no | Enables AI triage **and** Thai summaries |
+| `GEMINI_MODEL` | no | Comma-separated model list, tried in order |
+| `LINKEDIN_ACCESS_TOKEN` | no | Also post to LinkedIn — read the caveat below |
+| `LINKEDIN_AUTHOR_URN` | no | Skips the `/v2/userinfo` lookup |
+| `LINKEDIN_VERSION` | no | `YYYYMM`, default `202601` |
 | `GITHUB_TOKEN` | no | Raises the GitHub Search rate limit; Actions supplies it |
+
+Without `GEMINI_API_KEY` the bot still works: items are picked by the
+round-robin instead of the ranker, grouped by category instead of priority,
+and each carries the feed's own English blurb instead of a Thai summary.
 
 ---
 
@@ -90,26 +103,42 @@ embed, and leaves `data/seen_urls.json` untouched. To send for real, set
 
 | Category | Sources |
 | --- | --- |
-| ☁️ Cloud & Infrastructure | AWS What's New, Azure Updates, Google Cloud Blog |
-| 🚀 Platform & Kubernetes | Kubernetes Blog, CNCF Blog, Istio Blog |
-| 🛠️ DevOps & IaC | HashiCorp Blog, Docker Blog, GitHub Blog |
+| ☁️ Cloud & Infrastructure | AWS What's New, AWS Architecture, AWS Service Health, Azure Updates, Azure Tech Community, Google Cloud, Cloudflare |
+| 🚀 Platform & Kubernetes | Kubernetes Blog, CNCF, Istio, The New Stack, Kong, and release feeds for AKS, Kubernetes, Istio, Headlamp, OPA |
+| 🛠️ DevOps & IaC | HashiCorp, Docker, GitHub, GitLab, AWS DevOps, Azure DevOps |
+| 💾 Data & Streaming | Redis, Confluent (Kafka), Elastic, PostgreSQL, and release feeds for Kafka, Redis, Elasticsearch |
+| 📊 Observability | Grafana, Prometheus, OpenTelemetry, Datadog, New Relic, and release feeds for Fluentd, Fluent Bit, Grafana, Prometheus |
+| 🤖 AI & Models | OpenAI, Hugging Face, Google DeepMind |
 | 🔒 Security | The Hacker News, Krebs on Security |
-| 🔥 Trending | Hacker News (top 5), GitHub (new repos by stars) |
+| 🔥 Trending | Hacker News, GitHub (new repos by stars) |
 
 To add a source, append one dict to `FEEDS` in [src/main.py](src/main.py) with
 a `name`, a `category` key from `CATEGORIES`, and the feed `url`. Nothing else
 needs to change.
 
-Two of the URLs in the obvious places are dead and the working ones are not
-guessable, so they are worth noting:
+**Why so many GitHub release feeds.** Deprecations, breaking changes and
+version-support windows get announced in release notes, not in blog posts. A
+vendor blog is marketing; a release note is the contract. Their titles are
+thin (`Release 2026-09-04`) but the body carries the detail, and the body is
+what gets summarized.
 
-* `azure.microsoft.com/en-us/updates/feed/` returns an **HTML error page with
-  HTTP 200**. The live feed is `microsoft.com/releasecommunications/api/v2/azure/rss`.
-* `cloud.google.com/blog/feed` also answers 200 with HTML. The real one is
-  `cloudblog.withgoogle.com/rss/`.
+### Feeds that look fine and are not
 
-A 200 response is not a working feed. The bot treats "parsed, but zero
-entries" as a failure for exactly this reason.
+Every URL here was probed before being added, because **a 200 response is not
+a working feed.** The bot treats "parsed, but zero entries" as a failure for
+exactly this reason.
+
+| Obvious URL | What it actually does | What works |
+| --- | --- | --- |
+| `azure.microsoft.com/en-us/updates/feed/` | HTML error page, HTTP 200 | `microsoft.com/releasecommunications/api/v2/azure/rss` |
+| `cloud.google.com/blog/feed` | HTML, 0 entries, HTTP 200 | `cloudblog.withgoogle.com/rss/` |
+| `confluent.io/blog/feed/` | 404 | `confluent.io/feed/` |
+| `kafka.apache.org/blog.rss` | 404 | GitHub releases feed |
+| `konghq.com/blog/feed` | 404 | `konghq.com/feed` |
+| Azure Tech Community per-board RSS | 404 since the platform migration | the Azure category feed |
+
+Apigee and GKE release notes were probed and rejected for a different reason:
+every entry is titled with a bare date, which is useless as a headline.
 
 ---
 
@@ -143,6 +172,67 @@ Both formats share the delivered-items invariant described below. In `text`
 mode each message carries its own item list, so if part 2 of 3 fails, part 1's
 items are recorded as sent, parts 2 and 3 are not, and the job still exits
 non-zero.
+
+---
+
+## LinkedIn (optional secondary channel)
+
+Set `LINKEDIN_ACCESS_TOKEN` and the digest is also posted to your LinkedIn
+feed. Leave it unset and nothing changes.
+
+### The catch you need to know before you start
+
+**The token expires 60 days after it is issued, and you cannot automate the
+renewal.** Standard apps using `w_member_social` are not issued a refresh
+token at all — programmatic refresh is reserved for approved Marketing
+Developer Platform partners. Every 60 days you re-run the OAuth flow by hand
+and update the secret. Put a calendar reminder at day 55.
+
+This is why a LinkedIn failure **fails the whole job** even though Discord
+already went out: a 401 here needs a human, and a bot that goes quiet about it
+is worse than a red X.
+
+### Setup
+
+1. Create an app at <https://www.linkedin.com/developers/apps>, associate it
+   with a LinkedIn Page you admin, and add the **Share on LinkedIn** and
+   **Sign In with LinkedIn using OpenID Connect** products.
+2. Run the OAuth authorization-code flow with scopes `openid profile
+   w_member_social` and exchange the code for an access token.
+3. `gh secret set LINKEDIN_ACCESS_TOKEN --body "..."`
+
+`LINKEDIN_AUTHOR_URN` is optional — without it the bot calls `/v2/userinfo`
+and derives `urn:li:person:{sub}` itself. Set it to skip that request.
+
+`LINKEDIN_VERSION` defaults to `202601`. LinkedIn retires API versions on a
+rolling schedule and a stale one answers **426**, not 200; the error message
+says so explicitly and the fix is a workflow edit.
+
+### What posting to LinkedIn actually requires in code
+
+It is not Discord with a different URL, which is why `render_linkedin()` is a
+separate renderer rather than a parameter:
+
+* **No markdown.** `**bold**` renders as literal asterisks and
+  `[title](url)` as literal brackets. Structure has to come from line breaks,
+  and URLs go in bare for LinkedIn to auto-link.
+* **Reserved characters must be backslash-escaped** — `| { } @ [ ] ( ) < > #
+  \ * _ ~` — every one of them, even as ordinary punctuation, because the
+  Posts API parses `commentary` for inline entities. An unescaped `(` is a
+  422, not a cosmetic bug. See `escape_linkedin()`.
+* **3,000 characters**, against Discord's 2,000 per message across several
+  messages. One post, so the tail gets dropped if the digest runs long.
+
+### What about Facebook?
+
+**Personal profiles: not possible.** Meta removed `publish_actions` in 2018
+and there is no supported workaround — the Share dialog, where a human clicks
+post, is the only path.
+
+A **Facebook Page** is possible and is actually the better-behaved option of
+the two: a Page access token derived from a long-lived user token does not
+expire. It needs a Meta app with `pages_manage_posts`. Not implemented here;
+ask if you want it.
 
 ---
 
