@@ -114,6 +114,30 @@ LINKEDIN_HASHTAGS = (
     "#CloudNative", "#SRE", "#PlatformEngineering",
 )
 
+# Facebook Page. The second secondary channel, and the better-behaved one: a
+# Page access token derived from a long-lived user token does not expire, so
+# unlike LinkedIn there is nothing to rotate every 60 days.
+#
+# Two things keep it that way, and both are "do not touch" rather than "do":
+# the Meta app stays in Development mode (publishing it puts every token back
+# on a 60-day clock and drags in Business Verification for permissions we do
+# not need), and the Facebook password stays put (changing it revokes every
+# token the account ever issued).
+#
+# Posting to a personal profile is not an option at any price -- Meta removed
+# publish_actions in 2018 and shipped no replacement. A Page is the only path.
+FACEBOOK_API_VERSION = os.environ.get("FACEBOOK_API_VERSION", "v26.0").strip()
+# The real limit is 63,206 characters. A 14-item digest lands around 3k, so
+# unlike render_linkedin() there is no budget arithmetic and nothing is ever
+# dropped -- this constant is only the guard rail in render_facebook().
+FACEBOOK_TEXT_LIMIT = 63206
+# Same tags as LinkedIn. The same search index reads them either way, and a
+# Thai post carrying English tool names is the normal register here.
+FACEBOOK_HASHTAGS = (
+    "#DevOps", "#Kubernetes", "#Azure", "#AWS",
+    "#CloudNative", "#SRE", "#PlatformEngineering",
+)
+
 # Bangkok is UTC+7 year round and has never observed DST, so a fixed offset is
 # correct here. Using it avoids depending on the `tzdata` package, which is not
 # bundled with CPython on Windows.
@@ -1430,6 +1454,146 @@ def send_linkedin(session: requests.Session, items: list[NewsItem]) -> None:
 
     post_id = response.headers.get("x-restli-id", "?")
     log.info("LinkedIn: posted (%s)", post_id)
+
+
+# --------------------------------------------------------------------------
+# Facebook Page
+# --------------------------------------------------------------------------
+
+def render_facebook(items: list[NewsItem]) -> str:
+    """One Facebook Page post, plain text, Thai.
+
+    The simplest of the three renderers, for reasons that are the exact
+    inverse of LinkedIn's and worth spelling out:
+
+    * **Nothing needs escaping.** Facebook has no markdown -- `**bold**` posts
+      as literal asterisks -- but it also has no inline-entity parser, so
+      there is no `escape_facebook()` to match `escape_linkedin()`. What you
+      build is exactly what appears.
+    * **63,206 characters**, against LinkedIn's 3,000. The whole digest fits
+      with two orders of magnitude to spare, so no item is ever dropped and
+      there is no budget to track.
+    * **Thai**, from `summary`. Same audience as the Discord digest;
+      `summary_en` exists for LinkedIn's professional feed, not for this one.
+      That also means no extra Gemini pass is needed -- the Thai summaries are
+      already there for Discord.
+    * **Emoji stay in.** LinkedIn's plain style is a deliberate register
+      choice for a CV-adjacent feed; the same post reads cold on a Page, and
+      the category emoji already do navigation work in the Discord version.
+
+    Links go in bare. The Graph API's `link` field takes exactly one URL and
+    renders a preview card for it, which would promote one item above the
+    other thirteen for no reason, so it is left unset and Facebook auto-links
+    the URLs in the body.
+    """
+    today = datetime.now(BANGKOK).strftime("%d/%m/%Y")
+    lines = [f"\U0001F4F0 สรุปข่าว DevOps & Infrastructure ประจำวันที่ {today}"]
+
+    # Same two shapes as every other renderer: grouped by priority when the
+    # ranker ran, by category when Gemini was not configured.
+    ranked = any(i.priority for i in items)
+    groups = PRIORITIES if ranked else CATEGORIES
+
+    for key, meta in groups.items():
+        if ranked:
+            group = [i for i in items if (i.priority or "FYI") == key]
+            group.sort(key=lambda i: (i.score, i.published), reverse=True)
+        else:
+            group = [i for i in items if i.category == key]
+            group.sort(key=lambda i: i.published, reverse=True)
+        if not group:
+            continue
+
+        lines.append(f"\n{meta['emoji']} {meta['label']}")
+        for item in group:
+            lines.append(f"\n• {shorten(item.title, 140)}")
+            if item.summary:
+                lines.append(f"  {item.summary}")
+            lines.append(f"  {item.link}")
+
+    lines.append("\n" + " ".join(FACEBOOK_HASHTAGS))
+    text = "\n".join(lines)
+
+    # Belt and braces. MAX_TOTAL_ITEMS would have to grow by an order of
+    # magnitude for this to fire, but a trimmed post is a better way to find
+    # that out than a 400 at 7am.
+    if len(text) > FACEBOOK_TEXT_LIMIT:
+        log.warning("Facebook: post trimmed from %d to %d chars",
+                    len(text), FACEBOOK_TEXT_LIMIT)
+        text = text[:FACEBOOK_TEXT_LIMIT - 1].rstrip() + "…"
+    return text
+
+
+def send_facebook(session: requests.Session, items: list[NewsItem]) -> None:
+    """Post the digest to a Facebook Page. Raises with a readable reason."""
+    token = os.environ.get("FACEBOOK_PAGE_TOKEN", "").strip()
+    page_id = os.environ.get("FACEBOOK_PAGE_ID", "").strip()
+    # Both or neither. One without the other is a half-finished setup rather
+    # than a feature flag, so it says which half is missing instead of going
+    # quiet -- the quiet version costs a morning of wondering why nothing
+    # posted while the logs claim success.
+    if not token and not page_id:
+        log.info("Facebook: skipped (no FACEBOOK_PAGE_TOKEN / FACEBOOK_PAGE_ID)")
+        return
+    if not token or not page_id:
+        missing = "FACEBOOK_PAGE_TOKEN" if not token else "FACEBOOK_PAGE_ID"
+        raise RuntimeError(f"Facebook is half-configured: {missing} is not set")
+
+    text = render_facebook(items)
+    log.info("Facebook: posting to page %s (%d chars)", page_id, len(text))
+
+    # build_session()'s Retry allows GET only, so a POST that times out after
+    # Facebook already accepted it is never replayed. Losing a day's post is
+    # recoverable; posting the same digest twice to a public Page is not.
+    response = session.post(
+        f"https://graph.facebook.com/{FACEBOOK_API_VERSION}/{page_id}/feed",
+        # Form body, not query string. A token in a URL ends up in proxy logs,
+        # in CI logs, and in any error that echoes the request line back.
+        data={"message": text, "access_token": token},
+        timeout=HTTP_TIMEOUT,
+    )
+
+    if response.ok:
+        log.info("Facebook: posted (%s)", response.json().get("id", "?"))
+        return
+
+    # Graph answers every one of these as HTTP 400. The numeric code in the
+    # body is the part that tells you where to go and fix it, so it drives the
+    # message rather than the status does.
+    try:
+        error = response.json().get("error", {})
+    except ValueError:
+        error = {}
+    code = error.get("code")
+    message = error.get("message", response.text[:300])
+
+    if code == 190:
+        raise RuntimeError(
+            f"Facebook rejected the token (code 190): {message}. A Page token "
+            "does not expire on its own, so this is not the LinkedIn problem "
+            "-- suspect the Meta app being published, a Facebook password "
+            "change, or the app's access being revoked. Re-run the token flow "
+            "in the README and update FACEBOOK_PAGE_TOKEN."
+        )
+    if code in (10, 200, 283):
+        raise RuntimeError(
+            f"Facebook refused the post (code {code}): {message}. The token "
+            "authenticates but is not allowed to publish -- either "
+            "pages_manage_posts is missing, or FACEBOOK_PAGE_TOKEN holds a "
+            "user token instead of a Page token. Paste it into the Access "
+            "Token Debugger: Type must read 'Page', not 'User'."
+        )
+    if code in (4, 17, 32, 613):
+        raise RuntimeError(
+            f"Facebook rate limit (code {code}): {message}. One post a day is "
+            "far inside the quota, so suspect a re-run loop rather than the "
+            "limit itself."
+        )
+    raise RuntimeError(
+        f"Facebook returned {response.status_code} (code {code}): {message}"
+    )
+
+
 def main() -> int:
     # Windows consoles default to a legacy code page and would crash on the
     # emoji in these log lines. Harmless no-op on the Linux runner.
@@ -1501,6 +1665,11 @@ def main() -> int:
             print(f"\n----- DRY RUN: LinkedIn "
                   f"({len(preview)}/{LINKEDIN_TEXT_LIMIT} chars) -----")
             print(preview)
+
+            fb_preview = render_facebook(picked)
+            print(f"\n----- DRY RUN: Facebook "
+                  f"({len(fb_preview)}/{FACEBOOK_TEXT_LIMIT} chars) -----")
+            print(fb_preview)
             log.info("DRY_RUN=1 — not posting and not updating seen_urls.json")
             return 0
 
@@ -1534,14 +1703,27 @@ def main() -> int:
              len(delivered), SEEN_PATH.relative_to(REPO_ROOT))
 
     # Secondary channels run after the state is already safe. Discord is what
-    # dedup is keyed on, so a LinkedIn failure must never cause today's items
+    # dedup is keyed on, so a failure out here must never cause today's items
     # to be sent to Discord again tomorrow -- but it must still be visible,
-    # because the most likely cause is a 60-day token expiry that only a human
-    # can fix. Hence: record state, then fail the job anyway.
-    try:
-        send_linkedin(session, delivered)
-    except Exception as exc:
-        log.error("LinkedIn: %s", exc)
+    # because the likely causes (an expired LinkedIn token, a revoked Facebook
+    # app) are things only a human can fix. Hence: record state, then fail the
+    # job anyway.
+    #
+    # Every channel is attempted before the job gives up. Returning on the
+    # first failure was fine with one secondary channel and is a bug with two:
+    # LinkedIn's 60-day expiry is near-certain to happen eventually, and it
+    # must not take the Facebook post down with it. The two share nothing.
+    failures: list[str] = []
+    for name, send in (("LinkedIn", send_linkedin),
+                       ("Facebook", send_facebook)):
+        try:
+            send(session, delivered)
+        except Exception as exc:
+            log.error("%s: %s", name, exc)
+            failures.append(name)
+
+    if failures:
+        log.error("secondary channel(s) failed: %s", ", ".join(failures))
         return 1
 
     return 0

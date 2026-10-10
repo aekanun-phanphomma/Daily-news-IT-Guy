@@ -19,7 +19,7 @@ GitHub Actions (cron: 0 0 * * *  ==  07:00 ICT)
         └─ 7. POST to Discord, grouped by priority
         │
         ▼
-Discord  (+ LinkedIn, optional)
+Discord  (+ LinkedIn and Facebook Page, both optional)
         │
         ▼
 commit the updated data/seen_urls.json back to main
@@ -91,6 +91,9 @@ embed, and leaves `data/seen_urls.json` untouched. To send for real, set
 | `LINKEDIN_ACCESS_TOKEN` | no | Also post to LinkedIn — read the caveat below |
 | `LINKEDIN_AUTHOR_URN` | no | Skips the `/v2/userinfo` lookup |
 | `LINKEDIN_VERSION` | no | `YYYYMM`, default `202601` |
+| `FACEBOOK_PAGE_ID` | no | Also post to a Facebook Page — set both or neither |
+| `FACEBOOK_PAGE_TOKEN` | no | Page access token, non-expiring — see below |
+| `FACEBOOK_API_VERSION` | no | Graph API version, default `v26.0` |
 | `GITHUB_TOKEN` | no | Raises the GitHub Search rate limit; Actions supplies it |
 
 Without `GEMINI_API_KEY` the bot still works: items are picked by the
@@ -190,7 +193,8 @@ and update the secret. Put a calendar reminder at day 55.
 
 This is why a LinkedIn failure **fails the whole job** even though Discord
 already went out: a 401 here needs a human, and a bot that goes quiet about it
-is worse than a red X.
+is worse than a red X. It does not, however, stop the other secondary
+channels — `main()` attempts all of them and only then fails.
 
 ### Setup
 
@@ -223,16 +227,92 @@ separate renderer rather than a parameter:
 * **3,000 characters**, against Discord's 2,000 per message across several
   messages. One post, so the tail gets dropped if the digest runs long.
 
-### What about Facebook?
+---
 
-**Personal profiles: not possible.** Meta removed `publish_actions` in 2018
-and there is no supported workaround — the Share dialog, where a human clicks
-post, is the only path.
+## Facebook Page (optional secondary channel)
 
-A **Facebook Page** is possible and is actually the better-behaved option of
-the two: a Page access token derived from a long-lived user token does not
-expire. It needs a Meta app with `pages_manage_posts`. Not implemented here;
-ask if you want it.
+Set `FACEBOOK_PAGE_ID` and `FACEBOOK_PAGE_TOKEN` and the digest is also posted
+to your Page, in Thai. Leave both unset and nothing changes. Setting only one
+is a hard error rather than a silent skip — a half-finished setup that looks
+successful in the logs is the worst of both.
+
+**Personal profiles are not possible.** Meta removed `publish_actions` in 2018
+and shipped no replacement. The Share dialog, where a human clicks post, is the
+only path to a profile. A Page is the only automatable target.
+
+### The thing that makes this easier than LinkedIn
+
+**The Page token does not expire.** No 60-day rotation, no calendar reminder.
+`GET /debug_token` on it reads `Expires: Never`.
+
+That property is not free, though — it holds only while two things stay true:
+
+* **The Meta app stays in Development mode.** Publishing it puts every token
+  back on a 60-day clock and pulls Business Verification into scope for
+  permissions we do not need. There is no reason to publish: Development mode
+  already allows the app's own admins to act on Pages they administer, and you
+  are the only user this app will ever have.
+* **The Facebook password does not change.** That revokes every token the
+  account ever issued, this one included.
+
+### Getting the token
+
+1. Create an app at <https://developers.facebook.com/apps> with the use case
+   **Manage everything on your Page**. Confirm `pages_manage_posts`,
+   `pages_read_engagement` and `pages_show_list` all read **Ready for testing**
+   under that use case's permissions tab.
+2. Open the [Graph API Explorer][gae], select the app, tick those three
+   permissions, and click **Generate Access Token**.
+3. **On the consent screen, tick the Page.** Skipping this is the one mistake
+   that produces no error at all: the token is issued, it is valid, it simply
+   cannot see any Page, and step 4 returns an empty list with a 200.
+4. Query `me/accounts?fields=id,name,access_token`. The `id` is
+   `FACEBOOK_PAGE_ID`, the `access_token` is `FACEBOOK_PAGE_TOKEN`.
+5. Paste the Page token into the [Access Token Debugger][atd] and confirm two
+   lines: **Type: Page** (not User) and **Expires: Never**. Do not skip this —
+   if the user token behind step 4 was short-lived, everything works today and
+   dies silently in sixty days.
+6. `gh secret set FACEBOOK_PAGE_ID` and `gh secret set FACEBOOK_PAGE_TOKEN`.
+
+[gae]: https://developers.facebook.com/tools/explorer/
+[atd]: https://developers.facebook.com/tools/debug/accesstoken/
+
+Permissions showing **Ready for testing** (Standard Access) is the finished
+state, not an intermediate one. Advanced Access exists so that *other people*
+can connect *their* Pages to your app, which is not this.
+
+### What posting to Facebook actually requires in code
+
+`render_facebook()` is the third renderer, and it is the shortest — the
+constraints run opposite to LinkedIn's at almost every point:
+
+* **No escaping at all.** Facebook has no markdown, so `**bold**` would post
+  as literal asterisks, but it also has no inline-entity parser, so there is
+  no `escape_facebook()` to match `escape_linkedin()`. Plain text goes out
+  exactly as built.
+* **63,206 characters** against LinkedIn's 3,000. The digest lands near 3k, so
+  there is no budget arithmetic and no dropped tail. The limit appears in the
+  code only as a guard rail.
+* **Thai, from `summary`.** Same audience as Discord, so the existing Thai
+  pass covers it and no extra Gemini call is added. `summary_en` stays
+  LinkedIn's.
+* **Emoji stay in**, unlike LinkedIn. That was a register choice for a
+  CV-adjacent feed, not a technical limit.
+* **The `link` field is deliberately unset.** It accepts exactly one URL and
+  renders a preview card for it, which would promote one item above the other
+  thirteen. URLs go in the body bare and Facebook auto-links them.
+
+The token goes in the POST form body rather than the query string, so it stays
+out of proxy logs and out of any error that echoes the request line.
+
+### Why both secondary channels now run before the job fails
+
+Adding a second channel turned the old `return 1` on a LinkedIn failure into a
+bug. LinkedIn's token expiry is not a possibility but a certainty every sixty
+days, and on that morning it would have skipped the Facebook post entirely for
+a reason Facebook had nothing to do with. `main()` now attempts every channel,
+collects the failures, and fails the job at the end. Dedup state is still
+saved before any of it runs, so neither channel can cost a day of Discord news.
 
 ---
 
